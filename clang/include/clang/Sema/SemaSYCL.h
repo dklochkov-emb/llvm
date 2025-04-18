@@ -210,6 +210,10 @@ class SYCLIntegrationFooter {
 public:
   SYCLIntegrationFooter(SemaSYCL &S) : S(S) {}
   bool emit(StringRef MainSrc);
+  bool emitFreeFunctionDetails(const unsigned ShimCounter,
+                               const FunctionDecl *FD, SemaSYCL &DiagS,
+                               const std::string &ParamList,
+                               StringRef IntFooterName);
   void addVarDecl(const VarDecl *VD);
 
 private:
@@ -323,7 +327,10 @@ public:
 
   SYCLIntegrationFooter &getSyclIntegrationFooter() {
     if (SyclIntFooter == nullptr)
+    {
+      llvm::errs() << "Creating SYCLIntegrationFooter\n";
       SyclIntFooter = std::make_unique<SYCLIntegrationFooter>(*this);
+    }
     return *SyclIntFooter.get();
   }
 
@@ -333,7 +340,9 @@ public:
   }
 
   bool hasSyclIntegrationHeader() { return SyclIntHeader != nullptr; }
-  bool hasSyclIntegrationFooter() { return SyclIntFooter != nullptr; }
+  bool hasSyclIntegrationFooter() { 
+    llvm::errs() << "hasSyclIntegrationFooter\n";
+    return SyclIntFooter != nullptr; }
 
   enum SYCLRestrictKind {
     KernelGlobalVariable,

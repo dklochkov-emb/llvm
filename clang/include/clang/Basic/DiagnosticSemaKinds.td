@@ -12754,6 +12754,8 @@ def err_not_sycl_free_function : Error<
   "attempting to register a function that is not a SYCL free function as '%0'">;
 def err_variadic_free_function: Error<
   "free function can not be a variadic template function">;
+def err_non_static_class_member_function: Error<
+  "only static member functions are allowed as free function">;
 
 // SYCL kernel entry point diagnostics
 def err_sycl_entry_point_invalid : Error<

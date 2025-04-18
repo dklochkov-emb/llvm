@@ -6489,12 +6489,42 @@ static void PrintNSClosingBraces(raw_ostream &OS, const DeclContext *DC) {
       [](raw_ostream &OS, const NamespaceDecl *NS) {}, OS, DC);
 }
 
+/*
+static std::string insertClassString(const FunctionDecl *FD, raw_ostream &O,
+                                     SemaSYCL &S) {
+  const auto *Parent = FD->getParent();
+  if (!Parent || !isa<CXXRecordDecl>(Parent))
+  {
+    return {};
+  }
+  const auto *Record = cast<CXXRecordDecl>(Parent);
+  std::string ClassName;
+  if (const auto *MD = dyn_cast<CXXMethodDecl>(FD)) {
+    if (!MD->isStatic()) {
+      S.Diag(FD->getLocation(), diag::err_non_static_class_member_function);
+      return ClassName;
+    }
+    ClassName = Record->getNameAsString();
+    if (Record->isClass()) {
+      O << "class " << ClassName << " {\n";
+      O << "public:\n";
+    } else {
+      O << "struct " << ClassName << "{\n";
+    }
+    O << "static ";
+  }
+  llvm::errs() << "ClassName:" <<ClassName << "\n";
+  return ClassName;
+}
+*/
 class FreeFunctionPrinter {
   raw_ostream &O;
+  SemaSYCL &S;
+  std::string ClassName;
   bool NSInserted = false;
 
 public:
-  FreeFunctionPrinter(raw_ostream &O) : O(O) {}
+  FreeFunctionPrinter(raw_ostream &O, SemaSYCL &DiagS) : O(O), S(DiagS) {}
 
   /// Emits the function declaration of a free function.
   /// \param FD The function declaration to print.
@@ -6502,7 +6532,6 @@ public:
   void printFreeFunctionDeclaration(const FunctionDecl *FD,
                                     const std::string &Args,
                                     std::string_view Templated = "") {
-
     const DeclContext *DC = FD->getDeclContext();
     if (DC) {
       // if function in namespace, print namespace
@@ -6512,6 +6541,7 @@ public:
         // function
         NSInserted = true;
       }
+      //ClassName = insertClassString(FD, O, S);
       O << Templated;
       O << FD->getReturnType().getAsString() << " ";
       O << FD->getNameAsString() << "(" << Args << ");";
@@ -6520,6 +6550,8 @@ public:
         PrintNSClosingBraces(O, FD);
       }
       O << "\n";
+      //if (!ClassName.empty())
+      //  O << "};\n";
     }
   }
 
@@ -6535,7 +6567,56 @@ public:
 
     if (NSInserted)
       PrintNamespaces(O, FD, /*isPrintNamesOnly=*/true);
+    if (!ClassName.empty())
+      O << ClassName << "::";
     O << FD->getIdentifier()->getName().data();
+  }
+
+  /// Generates is_kernel, is_single_task_kernel and nd_range_kernel functions
+  /// \param ShimCounter The counter for the shim function
+  /// \param FD The function to print
+  void printFreeFunctionKernelDetails(const unsigned ShimCounter,
+                                      const FunctionDecl *FD) {
+    O << "namespace sycl {\n";
+    O << "template <>\n";
+    O << "struct ext::oneapi::experimental::is_kernel<__sycl_shim"
+      << ShimCounter << "()";
+    O << "> {\n";
+    O << "  static constexpr bool value = true;\n";
+    O << "};\n";
+    int Dim = getFreeFunctionRangeDim(S, FD);
+    O << "template <>\n";
+    if (Dim > 0)
+      O << "struct ext::oneapi::experimental::is_nd_range_kernel<__sycl_shim"
+        << ShimCounter << "(), " << Dim;
+    else
+      O << "struct "
+           "ext::oneapi::experimental::is_single_task_kernel<__sycl_shim"
+        << ShimCounter << "()";
+    O << "> {\n";
+    O << "  static constexpr bool value = true;\n";
+    O << "};\n";
+    O << "}\n";
+  }
+
+
+  /// Sets the class name for the free function if it is a member function.
+  /// \param FD The function declaration.
+  /// \return True if the class name was set, false otherwise.
+  bool setClassName(const FunctionDecl *FD) {
+    const auto *Parent = FD->getParent();
+    if (!Parent || !isa<CXXRecordDecl>(Parent))
+      return false;
+    const auto *Record = cast<CXXRecordDecl>(Parent);
+    const auto *MD = dyn_cast<CXXMethodDecl>(FD);
+    if (!MD)
+      return false;
+    if (!MD->isStatic()) {
+      S.Diag(FD->getLocation(), diag::err_non_static_class_member_function);
+      return false;
+    }
+    ClassName = Record->getNameAsString();
+    return true;
   }
 
   /// Helper method to get arguments of templated function as a string
@@ -6951,61 +7032,43 @@ void SYCLIntegrationHeader::emit(raw_ostream &O) {
     // template arguments that match default template arguments while printing
     // template-ids, even if the source code doesn't reference them.
     Policy.EnforceDefaultTemplateArgs = true;
-    FreeFunctionPrinter FFPrinter(O);
-    if (FTD) {
-      if (auto TemplatedDecl = FTD->getTemplatedDecl(); TemplatedDecl) {
-        const auto TemplatedDeclParams = FFPrinter.getTemplatedParamList(
-            TemplatedDecl->parameters(), Policy, true);
-        const std::string TeplatedParams =
-            FFPrinter.getTemplateParameters(FTD->getTemplateParameters(), S);
-        FFPrinter.printFreeFunctionDeclaration(
-            TemplatedDecl, TemplatedDeclParams, TeplatedParams);
+    if (!S.getSyclIntegrationFooter().emitFreeFunctionDetails(
+            ShimCounter, K.SyclKernel, S, ParmList,
+            S.getLangOpts().SYCLIntFooter)) {
+      FreeFunctionPrinter FFPrinter(O, S);
+      if (FTD) {
+        if (auto TemplatedDecl = FTD->getTemplatedDecl(); TemplatedDecl) {
+          const auto TemplatedDeclParams = FFPrinter.getTemplatedParamList(
+              TemplatedDecl->parameters(), Policy, true);
+          const std::string TeplatedParams =
+              FFPrinter.getTemplateParameters(FTD->getTemplateParameters(), S);
+          FFPrinter.printFreeFunctionDeclaration(
+              TemplatedDecl, TemplatedDeclParams, TeplatedParams);
+        }
+      } else
+        FFPrinter.printFreeFunctionDeclaration(K.SyclKernel, ParmListWithNames);
+      FFPrinter.printFreeFunctionShim(K.SyclKernel, ShimCounter, ParmList);
+      if (FTD) {
+        const TemplateArgumentList *TAL =
+            K.SyclKernel->getTemplateSpecializationArgs();
+        ArrayRef<TemplateArgument> A = TAL->asArray();
+        bool FirstParam = true;
+        O << "<";
+        for (const auto &X : A) {
+          if (FirstParam)
+            FirstParam = false;
+          else
+            O << ", ";
+          X.print(Policy, O, true);
+        }
+        O << ">";
       }
-    } else {
-      FFPrinter.printFreeFunctionDeclaration(K.SyclKernel, ParmListWithNames);
+      O << ";\n";
+      O << "}\n";
+      Policy.SuppressDefaultTemplateArgs = true;
+      Policy.EnforceDefaultTemplateArgs = false;
+      FFPrinter.printFreeFunctionKernelDetails(ShimCounter, K.SyclKernel);
     }
-    FFPrinter.printFreeFunctionShim(K.SyclKernel, ShimCounter, ParmList);
-    if (FTD) {
-      const TemplateArgumentList *TAL =
-          K.SyclKernel->getTemplateSpecializationArgs();
-      ArrayRef<TemplateArgument> A = TAL->asArray();
-      bool FirstParam = true;
-      O << "<";
-      for (const auto &X : A) {
-        if (FirstParam)
-          FirstParam = false;
-        else
-          O << ", ";
-        X.print(Policy, O, true);
-      }
-      O << ">";
-    }
-    O << ";\n";
-    O << "}\n";
-    Policy.SuppressDefaultTemplateArgs = true;
-    Policy.EnforceDefaultTemplateArgs = false;
-
-    // Generate is_kernel, is_single_task_kernel and nd_range_kernel functions.
-    O << "namespace sycl {\n";
-    O << "template <>\n";
-    O << "struct ext::oneapi::experimental::is_kernel<__sycl_shim"
-      << ShimCounter << "()";
-    O << "> {\n";
-    O << "  static constexpr bool value = true;\n";
-    O << "};\n";
-    int Dim = getFreeFunctionRangeDim(S, K.SyclKernel);
-    O << "template <>\n";
-    if (Dim > 0)
-      O << "struct ext::oneapi::experimental::is_nd_range_kernel<__sycl_shim"
-        << ShimCounter << "(), " << Dim;
-    else
-      O << "struct "
-           "ext::oneapi::experimental::is_single_task_kernel<__sycl_shim"
-        << ShimCounter << "()";
-    O << "> {\n";
-    O << "  static constexpr bool value = true;\n";
-    O << "};\n";
-    O << "}\n";
     ++ShimCounter;
   }
 
@@ -7207,6 +7270,34 @@ static std::string EmitShims(raw_ostream &OS, unsigned &ShimCounter,
 
   EmitShims(OS, ShimCounter, VD->getDeclContext(), RelativeName, Policy);
   return RelativeName;
+}
+
+/// Emits class static method free function kernel details to footer
+/// \param ShimCounter  Shim counter to be used for the function
+/// \param FD  pointer to the function
+/// \param O   the output stream
+/// \return true if the function is emitted, false otherwise
+bool SYCLIntegrationFooter::emitFreeFunctionDetails(
+    const unsigned ShimCounter, const FunctionDecl *FD, SemaSYCL &DiagS,
+    const std::string &ParamList, StringRef IntFooterName) {
+  if (IntFooterName.empty())
+    return false;
+  int IntFooterFD = 0;
+  std::error_code EC =
+      llvm::sys::fs::openFileForWrite(IntFooterName, IntFooterFD);
+  if (EC) {
+    llvm::errs() << "Error: " << EC.message() << "\n";
+    return false;
+  }
+  llvm::raw_fd_ostream Out(IntFooterFD, true /*close in destructor*/);
+  FreeFunctionPrinter Printer{Out, DiagS};
+  // No need to emit details if the function is not a static class method
+  if (!Printer.setClassName(FD))
+    return false;
+  Printer.printFreeFunctionShim(FD, ShimCounter, ParamList);
+  Out << ";\n}\n";
+  Printer.printFreeFunctionKernelDetails(ShimCounter, FD);
+  return true;
 }
 
 bool SYCLIntegrationFooter::emit(raw_ostream &OS) {

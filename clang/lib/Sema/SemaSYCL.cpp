@@ -6599,6 +6599,21 @@ public:
     O << "}\n";
   }
 
+  /// Generates definition of kernel_id of the free function.
+  /// \param Name The mangled name of free function.
+  /// \param ShimCounter The counter for the shim function.
+  void printFreeFunctionIdDefinition(const std::string &Name,
+                                     const unsigned ShimCounter) {
+    O << "\n// Definition of kernel_id of " << Name << "\n";
+    O << "namespace sycl {\n";
+    O << "template <>\n";
+    O << "kernel_id ext::oneapi::experimental::get_kernel_id<__sycl_shim"
+      << ShimCounter << "()>() {\n";
+    O << "  return sycl::detail::get_kernel_id_impl(std::string_view{\"" << Name
+      << "\"});\n";
+    O << "}\n";
+    O << "}\n";
+  }
 
   /// Sets the class name for the free function if it is a member function.
   /// \param FD The function declaration.
@@ -6964,6 +6979,7 @@ void SYCLIntegrationHeader::emit(raw_ostream &O) {
 
   unsigned ShimCounter = 1;
   int FreeFunctionCount = 0;
+  FreeFunctionPrinter FFPrinter(O, S);
   for (const KernelDesc &K : KernelDescs) {
     if (!S.isFreeFunction(K.SyclKernel))
       continue;
@@ -7033,9 +7049,7 @@ void SYCLIntegrationHeader::emit(raw_ostream &O) {
     // template-ids, even if the source code doesn't reference them.
     Policy.EnforceDefaultTemplateArgs = true;
     if (!S.getSyclIntegrationFooter().emitFreeFunctionDetails(
-            ShimCounter, K.SyclKernel, S, ParmList,
-            S.getLangOpts().SYCLIntFooter)) {
-      FreeFunctionPrinter FFPrinter(O, S);
+            ShimCounter, K.SyclKernel, ParmList, K.Name, S)) {
       if (FTD) {
         if (auto TemplatedDecl = FTD->getTemplatedDecl(); TemplatedDecl) {
           const auto TemplatedDeclParams = FFPrinter.getTemplatedParamList(
@@ -7079,16 +7093,12 @@ void SYCLIntegrationHeader::emit(raw_ostream &O) {
   for (const KernelDesc &K : KernelDescs) {
     if (!S.isFreeFunction(K.SyclKernel))
       continue;
-
-    O << "\n// Definition of kernel_id of " << K.Name << "\n";
-    O << "namespace sycl {\n";
-    O << "template <>\n";
-    O << "kernel_id ext::oneapi::experimental::get_kernel_id<__sycl_shim"
-      << ShimCounter << "()>() {\n";
-    O << "  return sycl::detail::get_kernel_id_impl(std::string_view{\""
-      << K.Name << "\"});\n";
-    O << "}\n";
-    O << "}\n";
+    const auto *MD = dyn_cast<CXXMethodDecl>(K.SyclKernel);
+    if (MD && MD->isStatic()) {
+      ShimCounter++;
+      continue;
+    }
+    FFPrinter.printFreeFunctionIdDefinition(K.Name, ShimCounter);
     ++ShimCounter;
   }
 }
@@ -7278,25 +7288,26 @@ static std::string EmitShims(raw_ostream &OS, unsigned &ShimCounter,
 /// \param O   the output stream
 /// \return true if the function is emitted, false otherwise
 bool SYCLIntegrationFooter::emitFreeFunctionDetails(
-    const unsigned ShimCounter, const FunctionDecl *FD, SemaSYCL &DiagS,
-    const std::string &ParamList, StringRef IntFooterName) {
-  if (IntFooterName.empty())
-    return false;
+    const unsigned ShimCounter, const FunctionDecl *FD,
+    const std::string &ParamList, const std::string &MangledName,
+    SemaSYCL &DiagS) {
   int IntFooterFD = 0;
-  std::error_code EC =
-      llvm::sys::fs::openFileForWrite(IntFooterName, IntFooterFD);
+  std::error_code EC = llvm::sys::fs::openFileForWrite(
+      S.getLangOpts().SYCLIntFooter, IntFooterFD);
   if (EC) {
     llvm::errs() << "Error: " << EC.message() << "\n";
     return false;
   }
   llvm::raw_fd_ostream Out(IntFooterFD, true /*close in destructor*/);
   FreeFunctionPrinter Printer{Out, DiagS};
-  // No need to emit details if the function is not a static class method
   if (!Printer.setClassName(FD))
     return false;
+
   Printer.printFreeFunctionShim(FD, ShimCounter, ParamList);
   Out << ";\n}\n";
   Printer.printFreeFunctionKernelDetails(ShimCounter, FD);
+  Out << "\n#include <sycl/kernel_bundle.hpp>\n";
+  Printer.printFreeFunctionIdDefinition(MangledName, ShimCounter);
   return true;
 }
 

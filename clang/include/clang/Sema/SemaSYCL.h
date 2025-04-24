@@ -211,9 +211,9 @@ public:
   SYCLIntegrationFooter(SemaSYCL &S) : S(S) {}
   bool emit(StringRef MainSrc);
   bool emitFreeFunctionDetails(const unsigned ShimCounter,
-                               const FunctionDecl *FD, SemaSYCL &DiagS,
+                               const FunctionDecl *FD,
                                const std::string &ParamList,
-                               StringRef IntFooterName);
+                               const std::string &MangledName, SemaSYCL &DiagS);
   void addVarDecl(const VarDecl *VD);
 
 private:

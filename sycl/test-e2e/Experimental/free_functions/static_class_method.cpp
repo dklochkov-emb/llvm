@@ -1,4 +1,5 @@
-// RUN: %{build} -Xclang -fsycl-int-footer=%t.h -o %t.out
+
+// RUN: %clangxx -fsycl --save-temps -v -std=c++17 %s -o %t.out
 // RUN: %{run} %t.out
 
 // The name mangling for free function kernels currently does not work with PTX.
@@ -58,7 +59,7 @@ void test_function_without_ns(sycl::queue &q, sycl::context &ctxt) {
       syclexp::get_kernel_bundle<TestClass::static_method,
                                  sycl::bundle_state::executable>(ctxt);
   sycl::kernel k_func =
-      exe_bndl.ext_oneapi_get_kernel<TestClass::static_method>();
+      exe_bndl.template ext_oneapi_get_kernel<TestClass::static_method>();
   call_kernel_code<float>(q, k_func);
 }
 

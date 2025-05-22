@@ -12954,10 +12954,11 @@ static bool getBuiltinAlignArguments(const CallExpr *E, EvalInfo &Info,
   return true;
 }
 
-static bool isSYCLFreeFunctionKernel(IntExprEvaluator &IEV,
-                                     const EvalInfo &Info, const CallExpr *E,
-                                     StringRef NameStr1, StringRef NameStr2,
-                                     bool CheckNDRangeKernelDim = false) {
+static constexpr bool
+isSYCLFreeFunctionKernel(IntExprEvaluator &IEV, const EvalInfo &Info,
+                         const CallExpr *E, StringRef NameStr1,
+                         StringRef NameStr2,
+                         bool CheckNDRangeKernelDim = false) {
   const Expr *ArgExpr = E->getArg(0)->IgnoreParenImpCasts();
   while (isa<CastExpr>(ArgExpr))
     ArgExpr = cast<CastExpr>(ArgExpr)->getSubExpr();
@@ -12968,1370 +12969,1387 @@ static bool isSYCLFreeFunctionKernel(IntExprEvaluator &IEV,
       auto *SAIRAttr = FD->getAttr<SYCLAddIRAttributesFunctionAttr>();
       if (!SAIRAttr)
         return IEV.Success(false, E);
-      SmallVector<std::pair<std::string, std::string>, 4> NameValuePairs =
-          SAIRAttr->getFilteredAttributeNameValuePairs(Info.Ctx);
-      for (const auto &NVPair : NameValuePairs) {
-        if (!NVPair.first.compare(NameStr1) ||
-            (!NameStr2.empty() && !NVPair.first.compare(NameStr2))) {
-          if (CheckNDRangeKernelDim) {
-            uint64_t Dim =
-                E->getArg(1)->EvaluateKnownConstInt(Info.Ctx).getZExtValue();
-            // Return true only if the dimensions match.
-            if (std::stoul(NVPair.second) == Dim)
-              return IEV.Success(true, E);
-            else
-              return IEV.Success(false, E);
-          }
-          // Return true if it has the sycl-single-task-kernel or the
-          // sycl-nd-range-kernel attribute.
-          return IEV.Success(true, E);
+
+      llvm::StringRef strValCmp;
+      int intVal = 0;
+      for (const Expr *E : SAIRAttr->args()) {
+        if (const StringLiteral *SL =
+                dyn_cast<StringLiteral>(E->IgnoreParenImpCasts())) {
+          strValCmp = SL->getString();
+        } else if (const IntegerLiteral *IL =
+                       dyn_cast<IntegerLiteral>(E->IgnoreParenImpCasts())) {
+          intVal = static_cast<int>(IL->getValue().getSExtValue());
         }
+      }
+      if (strValCmp == NameStr1 || strValCmp == NameStr2) {
+        if (CheckNDRangeKernelDim) {
+          uint64_t Dim =
+              E->getArg(1)->EvaluateKnownConstInt(Info.Ctx).getZExtValue();
+          // Return true only if the dimensions match.
+          if (intVal == Dim)
+            return IEV.Success(true, E);
+          else
+            return IEV.Success(false, E);
+        }
+        // Return true if it has the sycl-single-task-kernel or the
+        // sycl-nd-range-kernel attribute.
+        return IEV.Success(true, E);
       }
       return IEV.Success(false, E);
     }
   }
-  return false;
+  return IEV.Success(false, E);
 }
 
-bool IntExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
-                                            unsigned BuiltinOp) {
-  switch (BuiltinOp) {
-  default:
-    return false;
-
-  case Builtin::BI__builtin_dynamic_object_size:
-  case Builtin::BI__builtin_object_size: {
-    // The type was checked when we built the expression.
-    unsigned Type =
-        E->getArg(1)->EvaluateKnownConstInt(Info.Ctx).getZExtValue();
-    assert(Type <= 3 && "unexpected type");
-
-    uint64_t Size;
-    if (tryEvaluateBuiltinObjectSize(E->getArg(0), Type, Info, Size))
-      return Success(Size, E);
-
-    if (E->getArg(0)->HasSideEffects(Info.Ctx))
-      return Success((Type & 2) ? 0 : -1, E);
-
-    // Expression had no side effects, but we couldn't statically determine the
-    // size of the referenced object.
-    switch (Info.EvalMode) {
-    case EvalInfo::EM_ConstantExpression:
-    case EvalInfo::EM_ConstantFold:
-    case EvalInfo::EM_IgnoreSideEffects:
-      // Leave it to IR generation.
-      return Error(E);
-    case EvalInfo::EM_ConstantExpressionUnevaluated:
-      // Reduce it to a constant now.
-      return Success((Type & 2) ? 0 : -1, E);
-    }
-
-    llvm_unreachable("unexpected EvalMode");
-  }
-
-  case Builtin::BI__builtin_os_log_format_buffer_size: {
-    analyze_os_log::OSLogBufferLayout Layout;
-    analyze_os_log::computeOSLogBufferLayout(Info.Ctx, E, Layout);
-    return Success(Layout.size().getQuantity(), E);
-  }
-
-  case Builtin::BI__builtin_is_aligned: {
-    APValue Src;
-    APSInt Alignment;
-    if (!getBuiltinAlignArguments(E, Info, Src, Alignment))
-      return false;
-    if (Src.isLValue()) {
-      // If we evaluated a pointer, check the minimum known alignment.
-      LValue Ptr;
-      Ptr.setFrom(Info.Ctx, Src);
-      CharUnits BaseAlignment = getBaseAlignment(Info, Ptr);
-      CharUnits PtrAlign = BaseAlignment.alignmentAtOffset(Ptr.Offset);
-      // We can return true if the known alignment at the computed offset is
-      // greater than the requested alignment.
-      assert(PtrAlign.isPowerOfTwo());
-      assert(Alignment.isPowerOf2());
-      if (PtrAlign.getQuantity() >= Alignment)
-        return Success(1, E);
-      // If the alignment is not known to be sufficient, some cases could still
-      // be aligned at run time. However, if the requested alignment is less or
-      // equal to the base alignment and the offset is not aligned, we know that
-      // the run-time value can never be aligned.
-      if (BaseAlignment.getQuantity() >= Alignment &&
-          PtrAlign.getQuantity() < Alignment)
-        return Success(0, E);
-      // Otherwise we can't infer whether the value is sufficiently aligned.
-      // TODO: __builtin_is_aligned(__builtin_align_{down,up{(expr, N), N)
-      //  in cases where we can't fully evaluate the pointer.
-      Info.FFDiag(E->getArg(0), diag::note_constexpr_alignment_compute)
-          << Alignment;
-      return false;
-    }
-    assert(Src.isInt());
-    return Success((Src.getInt() & (Alignment - 1)) == 0 ? 1 : 0, E);
-  }
-  case Builtin::BI__builtin_align_up: {
-    APValue Src;
-    APSInt Alignment;
-    if (!getBuiltinAlignArguments(E, Info, Src, Alignment))
-      return false;
-    if (!Src.isInt())
-      return Error(E);
-    APSInt AlignedVal =
-        APSInt((Src.getInt() + (Alignment - 1)) & ~(Alignment - 1),
-               Src.getInt().isUnsigned());
-    assert(AlignedVal.getBitWidth() == Src.getInt().getBitWidth());
-    return Success(AlignedVal, E);
-  }
-  case Builtin::BI__builtin_align_down: {
-    APValue Src;
-    APSInt Alignment;
-    if (!getBuiltinAlignArguments(E, Info, Src, Alignment))
-      return false;
-    if (!Src.isInt())
-      return Error(E);
-    APSInt AlignedVal =
-        APSInt(Src.getInt() & ~(Alignment - 1), Src.getInt().isUnsigned());
-    assert(AlignedVal.getBitWidth() == Src.getInt().getBitWidth());
-    return Success(AlignedVal, E);
-  }
-
-  case Builtin::BI__builtin_bitreverse8:
-  case Builtin::BI__builtin_bitreverse16:
-  case Builtin::BI__builtin_bitreverse32:
-  case Builtin::BI__builtin_bitreverse64:
-  case Builtin::BI__builtin_elementwise_bitreverse: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-
-    return Success(Val.reverseBits(), E);
-  }
-
-  case Builtin::BI__builtin_bswap16:
-  case Builtin::BI__builtin_bswap32:
-  case Builtin::BI__builtin_bswap64: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-
-    return Success(Val.byteSwap(), E);
-  }
-
-  case Builtin::BI__builtin_classify_type:
-    return Success((int)EvaluateBuiltinClassifyType(E, Info.getLangOpts()), E);
-
-  case Builtin::BI__builtin_clrsb:
-  case Builtin::BI__builtin_clrsbl:
-  case Builtin::BI__builtin_clrsbll: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-
-    return Success(Val.getBitWidth() - Val.getSignificantBits(), E);
-  }
-
-  case Builtin::BI__builtin_clz:
-  case Builtin::BI__builtin_clzl:
-  case Builtin::BI__builtin_clzll:
-  case Builtin::BI__builtin_clzs:
-  case Builtin::BI__builtin_clzg:
-  case Builtin::BI__lzcnt16: // Microsoft variants of count leading-zeroes
-  case Builtin::BI__lzcnt:
-  case Builtin::BI__lzcnt64: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-
-    std::optional<APSInt> Fallback;
-    if (BuiltinOp == Builtin::BI__builtin_clzg && E->getNumArgs() > 1) {
-      APSInt FallbackTemp;
-      if (!EvaluateInteger(E->getArg(1), FallbackTemp, Info))
-        return false;
-      Fallback = FallbackTemp;
-    }
-
-    if (!Val) {
-      if (Fallback)
-        return Success(*Fallback, E);
-
-      // When the argument is 0, the result of GCC builtins is undefined,
-      // whereas for Microsoft intrinsics, the result is the bit-width of the
-      // argument.
-      bool ZeroIsUndefined = BuiltinOp != Builtin::BI__lzcnt16 &&
-                             BuiltinOp != Builtin::BI__lzcnt &&
-                             BuiltinOp != Builtin::BI__lzcnt64;
-
-      if (ZeroIsUndefined)
-        return Error(E);
-    }
-
-    return Success(Val.countl_zero(), E);
-  }
-
-  case Builtin::BI__builtin_constant_p: {
-    const Expr *Arg = E->getArg(0);
-    if (EvaluateBuiltinConstantP(Info, Arg))
-      return Success(true, E);
-    if (Info.InConstantContext || Arg->HasSideEffects(Info.Ctx)) {
-      // Outside a constant context, eagerly evaluate to false in the presence
-      // of side-effects in order to avoid -Wunsequenced false-positives in
-      // a branch on __builtin_constant_p(expr).
-      return Success(false, E);
-    }
-    Info.FFDiag(E, diag::note_invalid_subexpr_in_const_expr);
-    return false;
-  }
-
-  case Builtin::BI__noop:
-    // __noop always evaluates successfully and returns 0.
-    return Success(0, E);
-
-  case Builtin::BI__builtin_is_constant_evaluated: {
-    const auto *Callee = Info.CurrentCall->getCallee();
-    if (Info.InConstantContext && !Info.CheckingPotentialConstantExpression &&
-        (Info.CallStackDepth == 1 ||
-         (Info.CallStackDepth == 2 && Callee->isInStdNamespace() &&
-          Callee->getIdentifier() &&
-          Callee->getIdentifier()->isStr("is_constant_evaluated")))) {
-      // FIXME: Find a better way to avoid duplicated diagnostics.
-      if (Info.EvalStatus.Diag)
-        Info.report((Info.CallStackDepth == 1)
-                        ? E->getExprLoc()
-                        : Info.CurrentCall->getCallRange().getBegin(),
-                    diag::warn_is_constant_evaluated_always_true_constexpr)
-            << (Info.CallStackDepth == 1 ? "__builtin_is_constant_evaluated"
-                                         : "std::is_constant_evaluated");
-    }
-
-    return Success(Info.InConstantContext, E);
-  }
-
-  case Builtin::BI__builtin_is_within_lifetime:
-    if (auto result = EvaluateBuiltinIsWithinLifetime(*this, E))
-      return Success(*result, E);
-    return false;
-
-  case Builtin::BI__builtin_ctz:
-  case Builtin::BI__builtin_ctzl:
-  case Builtin::BI__builtin_ctzll:
-  case Builtin::BI__builtin_ctzs:
-  case Builtin::BI__builtin_ctzg: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-
-    std::optional<APSInt> Fallback;
-    if (BuiltinOp == Builtin::BI__builtin_ctzg && E->getNumArgs() > 1) {
-      APSInt FallbackTemp;
-      if (!EvaluateInteger(E->getArg(1), FallbackTemp, Info))
-        return false;
-      Fallback = FallbackTemp;
-    }
-
-    if (!Val) {
-      if (Fallback)
-        return Success(*Fallback, E);
-
-      return Error(E);
-    }
-
-    return Success(Val.countr_zero(), E);
-  }
-
-  case Builtin::BI__builtin_eh_return_data_regno: {
-    int Operand = E->getArg(0)->EvaluateKnownConstInt(Info.Ctx).getZExtValue();
-    Operand = Info.Ctx.getTargetInfo().getEHDataRegisterNumber(Operand);
-    return Success(Operand, E);
-  }
-
-  case Builtin::BI__builtin_expect:
-  case Builtin::BI__builtin_expect_with_probability:
-    return Visit(E->getArg(0));
-
-  case Builtin::BI__builtin_ptrauth_string_discriminator: {
-    const auto *Literal =
-        cast<StringLiteral>(E->getArg(0)->IgnoreParenImpCasts());
-    uint64_t Result = getPointerAuthStableSipHash(Literal->getString());
-    return Success(Result, E);
-  }
-
-  case Builtin::BI__builtin_ffs:
-  case Builtin::BI__builtin_ffsl:
-  case Builtin::BI__builtin_ffsll: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-
-    unsigned N = Val.countr_zero();
-    return Success(N == Val.getBitWidth() ? 0 : N + 1, E);
-  }
-
-  case Builtin::BI__builtin_fpclassify: {
-    APFloat Val(0.0);
-    if (!EvaluateFloat(E->getArg(5), Val, Info))
-      return false;
-    unsigned Arg;
-    switch (Val.getCategory()) {
-    case APFloat::fcNaN: Arg = 0; break;
-    case APFloat::fcInfinity: Arg = 1; break;
-    case APFloat::fcNormal: Arg = Val.isDenormal() ? 3 : 2; break;
-    case APFloat::fcZero: Arg = 4; break;
-    }
-    return Visit(E->getArg(Arg));
-  }
-
-  case Builtin::BI__builtin_isinf_sign: {
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success(Val.isInfinity() ? (Val.isNegative() ? -1 : 1) : 0, E);
-  }
-
-  case Builtin::BI__builtin_isinf: {
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success(Val.isInfinity() ? 1 : 0, E);
-  }
-
-  case Builtin::BI__builtin_isfinite: {
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success(Val.isFinite() ? 1 : 0, E);
-  }
-
-  case Builtin::BI__builtin_isnan: {
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success(Val.isNaN() ? 1 : 0, E);
-  }
-
-  case Builtin::BI__builtin_isnormal: {
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success(Val.isNormal() ? 1 : 0, E);
-  }
-
-  case Builtin::BI__builtin_issubnormal: {
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success(Val.isDenormal() ? 1 : 0, E);
-  }
-
-  case Builtin::BI__builtin_iszero: {
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success(Val.isZero() ? 1 : 0, E);
-  }
-
-  case Builtin::BI__builtin_signbit:
-  case Builtin::BI__builtin_signbitf:
-  case Builtin::BI__builtin_signbitl: {
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success(Val.isNegative() ? 1 : 0, E);
-  }
-
-  case Builtin::BI__builtin_isgreater:
-  case Builtin::BI__builtin_isgreaterequal:
-  case Builtin::BI__builtin_isless:
-  case Builtin::BI__builtin_islessequal:
-  case Builtin::BI__builtin_islessgreater:
-  case Builtin::BI__builtin_isunordered: {
-    APFloat LHS(0.0);
-    APFloat RHS(0.0);
-    if (!EvaluateFloat(E->getArg(0), LHS, Info) ||
-        !EvaluateFloat(E->getArg(1), RHS, Info))
-      return false;
-
-    return Success(
-        [&] {
-          switch (BuiltinOp) {
-          case Builtin::BI__builtin_isgreater:
-            return LHS > RHS;
-          case Builtin::BI__builtin_isgreaterequal:
-            return LHS >= RHS;
-          case Builtin::BI__builtin_isless:
-            return LHS < RHS;
-          case Builtin::BI__builtin_islessequal:
-            return LHS <= RHS;
-          case Builtin::BI__builtin_islessgreater: {
-            APFloat::cmpResult cmp = LHS.compare(RHS);
-            return cmp == APFloat::cmpResult::cmpLessThan ||
-                   cmp == APFloat::cmpResult::cmpGreaterThan;
-          }
-          case Builtin::BI__builtin_isunordered:
-            return LHS.compare(RHS) == APFloat::cmpResult::cmpUnordered;
-          default:
-            llvm_unreachable("Unexpected builtin ID: Should be a floating "
-                             "point comparison function");
-          }
-        }()
-            ? 1
-            : 0,
-        E);
-  }
-
-  case Builtin::BI__builtin_issignaling: {
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success(Val.isSignaling() ? 1 : 0, E);
-  }
-
-  case Builtin::BI__builtin_isfpclass: {
-    APSInt MaskVal;
-    if (!EvaluateInteger(E->getArg(1), MaskVal, Info))
-      return false;
-    unsigned Test = static_cast<llvm::FPClassTest>(MaskVal.getZExtValue());
-    APFloat Val(0.0);
-    return EvaluateFloat(E->getArg(0), Val, Info) &&
-           Success((Val.classify() & Test) ? 1 : 0, E);
-  }
-
-  case Builtin::BI__builtin_parity:
-  case Builtin::BI__builtin_parityl:
-  case Builtin::BI__builtin_parityll: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-
-    return Success(Val.popcount() % 2, E);
-  }
-
-  case Builtin::BI__builtin_abs:
-  case Builtin::BI__builtin_labs:
-  case Builtin::BI__builtin_llabs: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-    if (Val == APSInt(APInt::getSignedMinValue(Val.getBitWidth()),
-                      /*IsUnsigned=*/false))
-      return false;
-    if (Val.isNegative())
-      Val.negate();
-    return Success(Val, E);
-  }
-
-  case Builtin::BI__builtin_popcount:
-  case Builtin::BI__builtin_popcountl:
-  case Builtin::BI__builtin_popcountll:
-  case Builtin::BI__builtin_popcountg:
-  case Builtin::BI__builtin_elementwise_popcount:
-  case Builtin::BI__popcnt16: // Microsoft variants of popcount
-  case Builtin::BI__popcnt:
-  case Builtin::BI__popcnt64: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-
-    return Success(Val.popcount(), E);
-  }
-
-  case Builtin::BI__builtin_rotateleft8:
-  case Builtin::BI__builtin_rotateleft16:
-  case Builtin::BI__builtin_rotateleft32:
-  case Builtin::BI__builtin_rotateleft64:
-  case Builtin::BI_rotl8: // Microsoft variants of rotate right
-  case Builtin::BI_rotl16:
-  case Builtin::BI_rotl:
-  case Builtin::BI_lrotl:
-  case Builtin::BI_rotl64: {
-    APSInt Val, Amt;
-    if (!EvaluateInteger(E->getArg(0), Val, Info) ||
-        !EvaluateInteger(E->getArg(1), Amt, Info))
-      return false;
-
-    return Success(Val.rotl(Amt.urem(Val.getBitWidth())), E);
-  }
-
-  case Builtin::BI__builtin_rotateright8:
-  case Builtin::BI__builtin_rotateright16:
-  case Builtin::BI__builtin_rotateright32:
-  case Builtin::BI__builtin_rotateright64:
-  case Builtin::BI_rotr8: // Microsoft variants of rotate right
-  case Builtin::BI_rotr16:
-  case Builtin::BI_rotr:
-  case Builtin::BI_lrotr:
-  case Builtin::BI_rotr64: {
-    APSInt Val, Amt;
-    if (!EvaluateInteger(E->getArg(0), Val, Info) ||
-        !EvaluateInteger(E->getArg(1), Amt, Info))
-      return false;
-
-    return Success(Val.rotr(Amt.urem(Val.getBitWidth())), E);
-  }
-
-  case Builtin::BI__builtin_elementwise_add_sat: {
-    APSInt LHS, RHS;
-    if (!EvaluateInteger(E->getArg(0), LHS, Info) ||
-        !EvaluateInteger(E->getArg(1), RHS, Info))
-      return false;
-
-    APInt Result = LHS.isSigned() ? LHS.sadd_sat(RHS) : LHS.uadd_sat(RHS);
-    return Success(APSInt(Result, !LHS.isSigned()), E);
-  }
-  case Builtin::BI__builtin_elementwise_sub_sat: {
-    APSInt LHS, RHS;
-    if (!EvaluateInteger(E->getArg(0), LHS, Info) ||
-        !EvaluateInteger(E->getArg(1), RHS, Info))
-      return false;
-
-    APInt Result = LHS.isSigned() ? LHS.ssub_sat(RHS) : LHS.usub_sat(RHS);
-    return Success(APSInt(Result, !LHS.isSigned()), E);
-  }
-
-  case Builtin::BIstrlen:
-  case Builtin::BIwcslen:
-    // A call to strlen is not a constant expression.
-    if (Info.getLangOpts().CPlusPlus11)
-      Info.CCEDiag(E, diag::note_constexpr_invalid_function)
-          << /*isConstexpr*/ 0 << /*isConstructor*/ 0
-          << Info.Ctx.BuiltinInfo.getQuotedName(BuiltinOp);
-    else
-      Info.CCEDiag(E, diag::note_invalid_subexpr_in_const_expr);
-    [[fallthrough]];
-  case Builtin::BI__builtin_strlen:
-  case Builtin::BI__builtin_wcslen: {
-    // As an extension, we support __builtin_strlen() as a constant expression,
-    // and support folding strlen() to a constant.
-    uint64_t StrLen;
-    if (EvaluateBuiltinStrLen(E->getArg(0), StrLen, Info))
-      return Success(StrLen, E);
-    return false;
-  }
-
-  case Builtin::BIstrcmp:
-  case Builtin::BIwcscmp:
-  case Builtin::BIstrncmp:
-  case Builtin::BIwcsncmp:
-  case Builtin::BImemcmp:
-  case Builtin::BIbcmp:
-  case Builtin::BIwmemcmp:
-    // A call to strlen is not a constant expression.
-    if (Info.getLangOpts().CPlusPlus11)
-      Info.CCEDiag(E, diag::note_constexpr_invalid_function)
-          << /*isConstexpr*/ 0 << /*isConstructor*/ 0
-          << Info.Ctx.BuiltinInfo.getQuotedName(BuiltinOp);
-    else
-      Info.CCEDiag(E, diag::note_invalid_subexpr_in_const_expr);
-    [[fallthrough]];
-  case Builtin::BI__builtin_strcmp:
-  case Builtin::BI__builtin_wcscmp:
-  case Builtin::BI__builtin_strncmp:
-  case Builtin::BI__builtin_wcsncmp:
-  case Builtin::BI__builtin_memcmp:
-  case Builtin::BI__builtin_bcmp:
-  case Builtin::BI__builtin_wmemcmp: {
-    LValue String1, String2;
-    if (!EvaluatePointer(E->getArg(0), String1, Info) ||
-        !EvaluatePointer(E->getArg(1), String2, Info))
-      return false;
-
-    uint64_t MaxLength = uint64_t(-1);
-    if (BuiltinOp != Builtin::BIstrcmp &&
-        BuiltinOp != Builtin::BIwcscmp &&
-        BuiltinOp != Builtin::BI__builtin_strcmp &&
-        BuiltinOp != Builtin::BI__builtin_wcscmp) {
-      APSInt N;
-      if (!EvaluateInteger(E->getArg(2), N, Info))
-        return false;
-      MaxLength = N.getZExtValue();
-    }
-
-    // Empty substrings compare equal by definition.
-    if (MaxLength == 0u)
-      return Success(0, E);
-
-    if (!String1.checkNullPointerForFoldAccess(Info, E, AK_Read) ||
-        !String2.checkNullPointerForFoldAccess(Info, E, AK_Read) ||
-        String1.Designator.Invalid || String2.Designator.Invalid)
-      return false;
-
-    QualType CharTy1 = String1.Designator.getType(Info.Ctx);
-    QualType CharTy2 = String2.Designator.getType(Info.Ctx);
-
-    bool IsRawByte = BuiltinOp == Builtin::BImemcmp ||
-                     BuiltinOp == Builtin::BIbcmp ||
-                     BuiltinOp == Builtin::BI__builtin_memcmp ||
-                     BuiltinOp == Builtin::BI__builtin_bcmp;
-
-    assert(IsRawByte ||
-           (Info.Ctx.hasSameUnqualifiedType(
-                CharTy1, E->getArg(0)->getType()->getPointeeType()) &&
-            Info.Ctx.hasSameUnqualifiedType(CharTy1, CharTy2)));
-
-    // For memcmp, allow comparing any arrays of '[[un]signed] char' or
-    // 'char8_t', but no other types.
-    if (IsRawByte &&
-        !(isOneByteCharacterType(CharTy1) && isOneByteCharacterType(CharTy2))) {
-      // FIXME: Consider using our bit_cast implementation to support this.
-      Info.FFDiag(E, diag::note_constexpr_memcmp_unsupported)
-          << Info.Ctx.BuiltinInfo.getQuotedName(BuiltinOp) << CharTy1
-          << CharTy2;
-      return false;
-    }
-
-    const auto &ReadCurElems = [&](APValue &Char1, APValue &Char2) {
-      return handleLValueToRValueConversion(Info, E, CharTy1, String1, Char1) &&
-             handleLValueToRValueConversion(Info, E, CharTy2, String2, Char2) &&
-             Char1.isInt() && Char2.isInt();
-    };
-    const auto &AdvanceElems = [&] {
-      return HandleLValueArrayAdjustment(Info, E, String1, CharTy1, 1) &&
-             HandleLValueArrayAdjustment(Info, E, String2, CharTy2, 1);
-    };
-
-    bool StopAtNull =
-        (BuiltinOp != Builtin::BImemcmp && BuiltinOp != Builtin::BIbcmp &&
-         BuiltinOp != Builtin::BIwmemcmp &&
-         BuiltinOp != Builtin::BI__builtin_memcmp &&
-         BuiltinOp != Builtin::BI__builtin_bcmp &&
-         BuiltinOp != Builtin::BI__builtin_wmemcmp);
-    bool IsWide = BuiltinOp == Builtin::BIwcscmp ||
-                  BuiltinOp == Builtin::BIwcsncmp ||
-                  BuiltinOp == Builtin::BIwmemcmp ||
-                  BuiltinOp == Builtin::BI__builtin_wcscmp ||
-                  BuiltinOp == Builtin::BI__builtin_wcsncmp ||
-                  BuiltinOp == Builtin::BI__builtin_wmemcmp;
-
-    for (; MaxLength; --MaxLength) {
-      APValue Char1, Char2;
-      if (!ReadCurElems(Char1, Char2))
-        return false;
-      if (Char1.getInt().ne(Char2.getInt())) {
-        if (IsWide) // wmemcmp compares with wchar_t signedness.
-          return Success(Char1.getInt() < Char2.getInt() ? -1 : 1, E);
-        // memcmp always compares unsigned chars.
-        return Success(Char1.getInt().ult(Char2.getInt()) ? -1 : 1, E);
-      }
-      if (StopAtNull && !Char1.getInt())
-        return Success(0, E);
-      assert(!(StopAtNull && !Char2.getInt()));
-      if (!AdvanceElems())
-        return false;
-    }
-    // We hit the strncmp / memcmp limit.
-    return Success(0, E);
-  }
-
-  case Builtin::BI__atomic_always_lock_free:
-  case Builtin::BI__atomic_is_lock_free:
-  case Builtin::BI__c11_atomic_is_lock_free: {
-    APSInt SizeVal;
-    if (!EvaluateInteger(E->getArg(0), SizeVal, Info))
-      return false;
-
-    // For __atomic_is_lock_free(sizeof(_Atomic(T))), if the size is a power
-    // of two less than or equal to the maximum inline atomic width, we know it
-    // is lock-free.  If the size isn't a power of two, or greater than the
-    // maximum alignment where we promote atomics, we know it is not lock-free
-    // (at least not in the sense of atomic_is_lock_free).  Otherwise,
-    // the answer can only be determined at runtime; for example, 16-byte
-    // atomics have lock-free implementations on some, but not all,
-    // x86-64 processors.
-
-    // Check power-of-two.
-    CharUnits Size = CharUnits::fromQuantity(SizeVal.getZExtValue());
-    if (Size.isPowerOfTwo()) {
-      // Check against inlining width.
-      unsigned InlineWidthBits =
-          Info.Ctx.getTargetInfo().getMaxAtomicInlineWidth();
-      if (Size <= Info.Ctx.toCharUnitsFromBits(InlineWidthBits)) {
-        if (BuiltinOp == Builtin::BI__c11_atomic_is_lock_free ||
-            Size == CharUnits::One())
-          return Success(1, E);
-
-        // If the pointer argument can be evaluated to a compile-time constant
-        // integer (or nullptr), check if that value is appropriately aligned.
-        const Expr *PtrArg = E->getArg(1);
-        Expr::EvalResult ExprResult;
-        APSInt IntResult;
-        if (PtrArg->EvaluateAsRValue(ExprResult, Info.Ctx) &&
-            ExprResult.Val.toIntegralConstant(IntResult, PtrArg->getType(),
-                                              Info.Ctx) &&
-            IntResult.isAligned(Size.getAsAlign()))
-          return Success(1, E);
-
-        // Otherwise, check if the type's alignment against Size.
-        if (auto *ICE = dyn_cast<ImplicitCastExpr>(PtrArg)) {
-          // Drop the potential implicit-cast to 'const volatile void*', getting
-          // the underlying type.
-          if (ICE->getCastKind() == CK_BitCast)
-            PtrArg = ICE->getSubExpr();
-        }
-
-        if (auto PtrTy = PtrArg->getType()->getAs<PointerType>()) {
-          QualType PointeeType = PtrTy->getPointeeType();
-          if (!PointeeType->isIncompleteType() &&
-              Info.Ctx.getTypeAlignInChars(PointeeType) >= Size) {
-            // OK, we will inline operations on this object.
-            return Success(1, E);
-          }
-        }
-      }
-    }
-
-    return BuiltinOp == Builtin::BI__atomic_always_lock_free ?
-        Success(0, E) : Error(E);
-  }
-  case Builtin::BI__builtin_addcb:
-  case Builtin::BI__builtin_addcs:
-  case Builtin::BI__builtin_addc:
-  case Builtin::BI__builtin_addcl:
-  case Builtin::BI__builtin_addcll:
-  case Builtin::BI__builtin_subcb:
-  case Builtin::BI__builtin_subcs:
-  case Builtin::BI__builtin_subc:
-  case Builtin::BI__builtin_subcl:
-  case Builtin::BI__builtin_subcll: {
-    LValue CarryOutLValue;
-    APSInt LHS, RHS, CarryIn, CarryOut, Result;
-    QualType ResultType = E->getArg(0)->getType();
-    if (!EvaluateInteger(E->getArg(0), LHS, Info) ||
-        !EvaluateInteger(E->getArg(1), RHS, Info) ||
-        !EvaluateInteger(E->getArg(2), CarryIn, Info) ||
-        !EvaluatePointer(E->getArg(3), CarryOutLValue, Info))
-      return false;
-    // Copy the number of bits and sign.
-    Result = LHS;
-    CarryOut = LHS;
-
-    bool FirstOverflowed = false;
-    bool SecondOverflowed = false;
+  bool IntExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
+                                              unsigned BuiltinOp) {
     switch (BuiltinOp) {
     default:
-      llvm_unreachable("Invalid value for BuiltinOp");
+      return false;
+
+    case Builtin::BI__builtin_dynamic_object_size:
+    case Builtin::BI__builtin_object_size: {
+      // The type was checked when we built the expression.
+      unsigned Type =
+          E->getArg(1)->EvaluateKnownConstInt(Info.Ctx).getZExtValue();
+      assert(Type <= 3 && "unexpected type");
+
+      uint64_t Size;
+      if (tryEvaluateBuiltinObjectSize(E->getArg(0), Type, Info, Size))
+        return Success(Size, E);
+
+      if (E->getArg(0)->HasSideEffects(Info.Ctx))
+        return Success((Type & 2) ? 0 : -1, E);
+
+      // Expression had no side effects, but we couldn't statically determine
+      // the size of the referenced object.
+      switch (Info.EvalMode) {
+      case EvalInfo::EM_ConstantExpression:
+      case EvalInfo::EM_ConstantFold:
+      case EvalInfo::EM_IgnoreSideEffects:
+        // Leave it to IR generation.
+        return Error(E);
+      case EvalInfo::EM_ConstantExpressionUnevaluated:
+        // Reduce it to a constant now.
+        return Success((Type & 2) ? 0 : -1, E);
+      }
+
+      llvm_unreachable("unexpected EvalMode");
+    }
+
+    case Builtin::BI__builtin_os_log_format_buffer_size: {
+      analyze_os_log::OSLogBufferLayout Layout;
+      analyze_os_log::computeOSLogBufferLayout(Info.Ctx, E, Layout);
+      return Success(Layout.size().getQuantity(), E);
+    }
+
+    case Builtin::BI__builtin_is_aligned: {
+      APValue Src;
+      APSInt Alignment;
+      if (!getBuiltinAlignArguments(E, Info, Src, Alignment))
+        return false;
+      if (Src.isLValue()) {
+        // If we evaluated a pointer, check the minimum known alignment.
+        LValue Ptr;
+        Ptr.setFrom(Info.Ctx, Src);
+        CharUnits BaseAlignment = getBaseAlignment(Info, Ptr);
+        CharUnits PtrAlign = BaseAlignment.alignmentAtOffset(Ptr.Offset);
+        // We can return true if the known alignment at the computed offset is
+        // greater than the requested alignment.
+        assert(PtrAlign.isPowerOfTwo());
+        assert(Alignment.isPowerOf2());
+        if (PtrAlign.getQuantity() >= Alignment)
+          return Success(1, E);
+        // If the alignment is not known to be sufficient, some cases could
+        // still be aligned at run time. However, if the requested alignment is
+        // less or equal to the base alignment and the offset is not aligned, we
+        // know that the run-time value can never be aligned.
+        if (BaseAlignment.getQuantity() >= Alignment &&
+            PtrAlign.getQuantity() < Alignment)
+          return Success(0, E);
+        // Otherwise we can't infer whether the value is sufficiently aligned.
+        // TODO: __builtin_is_aligned(__builtin_align_{down,up{(expr, N), N)
+        //  in cases where we can't fully evaluate the pointer.
+        Info.FFDiag(E->getArg(0), diag::note_constexpr_alignment_compute)
+            << Alignment;
+        return false;
+      }
+      assert(Src.isInt());
+      return Success((Src.getInt() & (Alignment - 1)) == 0 ? 1 : 0, E);
+    }
+    case Builtin::BI__builtin_align_up: {
+      APValue Src;
+      APSInt Alignment;
+      if (!getBuiltinAlignArguments(E, Info, Src, Alignment))
+        return false;
+      if (!Src.isInt())
+        return Error(E);
+      APSInt AlignedVal =
+          APSInt((Src.getInt() + (Alignment - 1)) & ~(Alignment - 1),
+                 Src.getInt().isUnsigned());
+      assert(AlignedVal.getBitWidth() == Src.getInt().getBitWidth());
+      return Success(AlignedVal, E);
+    }
+    case Builtin::BI__builtin_align_down: {
+      APValue Src;
+      APSInt Alignment;
+      if (!getBuiltinAlignArguments(E, Info, Src, Alignment))
+        return false;
+      if (!Src.isInt())
+        return Error(E);
+      APSInt AlignedVal =
+          APSInt(Src.getInt() & ~(Alignment - 1), Src.getInt().isUnsigned());
+      assert(AlignedVal.getBitWidth() == Src.getInt().getBitWidth());
+      return Success(AlignedVal, E);
+    }
+
+    case Builtin::BI__builtin_bitreverse8:
+    case Builtin::BI__builtin_bitreverse16:
+    case Builtin::BI__builtin_bitreverse32:
+    case Builtin::BI__builtin_bitreverse64:
+    case Builtin::BI__builtin_elementwise_bitreverse: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+
+      return Success(Val.reverseBits(), E);
+    }
+
+    case Builtin::BI__builtin_bswap16:
+    case Builtin::BI__builtin_bswap32:
+    case Builtin::BI__builtin_bswap64: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+
+      return Success(Val.byteSwap(), E);
+    }
+
+    case Builtin::BI__builtin_classify_type:
+      return Success((int)EvaluateBuiltinClassifyType(E, Info.getLangOpts()),
+                     E);
+
+    case Builtin::BI__builtin_clrsb:
+    case Builtin::BI__builtin_clrsbl:
+    case Builtin::BI__builtin_clrsbll: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+
+      return Success(Val.getBitWidth() - Val.getSignificantBits(), E);
+    }
+
+    case Builtin::BI__builtin_clz:
+    case Builtin::BI__builtin_clzl:
+    case Builtin::BI__builtin_clzll:
+    case Builtin::BI__builtin_clzs:
+    case Builtin::BI__builtin_clzg:
+    case Builtin::BI__lzcnt16: // Microsoft variants of count leading-zeroes
+    case Builtin::BI__lzcnt:
+    case Builtin::BI__lzcnt64: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+
+      std::optional<APSInt> Fallback;
+      if (BuiltinOp == Builtin::BI__builtin_clzg && E->getNumArgs() > 1) {
+        APSInt FallbackTemp;
+        if (!EvaluateInteger(E->getArg(1), FallbackTemp, Info))
+          return false;
+        Fallback = FallbackTemp;
+      }
+
+      if (!Val) {
+        if (Fallback)
+          return Success(*Fallback, E);
+
+        // When the argument is 0, the result of GCC builtins is undefined,
+        // whereas for Microsoft intrinsics, the result is the bit-width of the
+        // argument.
+        bool ZeroIsUndefined = BuiltinOp != Builtin::BI__lzcnt16 &&
+                               BuiltinOp != Builtin::BI__lzcnt &&
+                               BuiltinOp != Builtin::BI__lzcnt64;
+
+        if (ZeroIsUndefined)
+          return Error(E);
+      }
+
+      return Success(Val.countl_zero(), E);
+    }
+
+    case Builtin::BI__builtin_constant_p: {
+      const Expr *Arg = E->getArg(0);
+      if (EvaluateBuiltinConstantP(Info, Arg))
+        return Success(true, E);
+      if (Info.InConstantContext || Arg->HasSideEffects(Info.Ctx)) {
+        // Outside a constant context, eagerly evaluate to false in the presence
+        // of side-effects in order to avoid -Wunsequenced false-positives in
+        // a branch on __builtin_constant_p(expr).
+        return Success(false, E);
+      }
+      Info.FFDiag(E, diag::note_invalid_subexpr_in_const_expr);
+      return false;
+    }
+
+    case Builtin::BI__noop:
+      // __noop always evaluates successfully and returns 0.
+      return Success(0, E);
+
+    case Builtin::BI__builtin_is_constant_evaluated: {
+      const auto *Callee = Info.CurrentCall->getCallee();
+      if (Info.InConstantContext && !Info.CheckingPotentialConstantExpression &&
+          (Info.CallStackDepth == 1 ||
+           (Info.CallStackDepth == 2 && Callee->isInStdNamespace() &&
+            Callee->getIdentifier() &&
+            Callee->getIdentifier()->isStr("is_constant_evaluated")))) {
+        // FIXME: Find a better way to avoid duplicated diagnostics.
+        if (Info.EvalStatus.Diag)
+          Info.report((Info.CallStackDepth == 1)
+                          ? E->getExprLoc()
+                          : Info.CurrentCall->getCallRange().getBegin(),
+                      diag::warn_is_constant_evaluated_always_true_constexpr)
+              << (Info.CallStackDepth == 1 ? "__builtin_is_constant_evaluated"
+                                           : "std::is_constant_evaluated");
+      }
+
+      return Success(Info.InConstantContext, E);
+    }
+
+    case Builtin::BI__builtin_is_within_lifetime:
+      if (auto result = EvaluateBuiltinIsWithinLifetime(*this, E))
+        return Success(*result, E);
+      return false;
+
+    case Builtin::BI__builtin_ctz:
+    case Builtin::BI__builtin_ctzl:
+    case Builtin::BI__builtin_ctzll:
+    case Builtin::BI__builtin_ctzs:
+    case Builtin::BI__builtin_ctzg: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+
+      std::optional<APSInt> Fallback;
+      if (BuiltinOp == Builtin::BI__builtin_ctzg && E->getNumArgs() > 1) {
+        APSInt FallbackTemp;
+        if (!EvaluateInteger(E->getArg(1), FallbackTemp, Info))
+          return false;
+        Fallback = FallbackTemp;
+      }
+
+      if (!Val) {
+        if (Fallback)
+          return Success(*Fallback, E);
+
+        return Error(E);
+      }
+
+      return Success(Val.countr_zero(), E);
+    }
+
+    case Builtin::BI__builtin_eh_return_data_regno: {
+      int Operand =
+          E->getArg(0)->EvaluateKnownConstInt(Info.Ctx).getZExtValue();
+      Operand = Info.Ctx.getTargetInfo().getEHDataRegisterNumber(Operand);
+      return Success(Operand, E);
+    }
+
+    case Builtin::BI__builtin_expect:
+    case Builtin::BI__builtin_expect_with_probability:
+      return Visit(E->getArg(0));
+
+    case Builtin::BI__builtin_ptrauth_string_discriminator: {
+      const auto *Literal =
+          cast<StringLiteral>(E->getArg(0)->IgnoreParenImpCasts());
+      uint64_t Result = getPointerAuthStableSipHash(Literal->getString());
+      return Success(Result, E);
+    }
+
+    case Builtin::BI__builtin_ffs:
+    case Builtin::BI__builtin_ffsl:
+    case Builtin::BI__builtin_ffsll: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+
+      unsigned N = Val.countr_zero();
+      return Success(N == Val.getBitWidth() ? 0 : N + 1, E);
+    }
+
+    case Builtin::BI__builtin_fpclassify: {
+      APFloat Val(0.0);
+      if (!EvaluateFloat(E->getArg(5), Val, Info))
+        return false;
+      unsigned Arg;
+      switch (Val.getCategory()) {
+      case APFloat::fcNaN:
+        Arg = 0;
+        break;
+      case APFloat::fcInfinity:
+        Arg = 1;
+        break;
+      case APFloat::fcNormal:
+        Arg = Val.isDenormal() ? 3 : 2;
+        break;
+      case APFloat::fcZero:
+        Arg = 4;
+        break;
+      }
+      return Visit(E->getArg(Arg));
+    }
+
+    case Builtin::BI__builtin_isinf_sign: {
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success(Val.isInfinity() ? (Val.isNegative() ? -1 : 1) : 0, E);
+    }
+
+    case Builtin::BI__builtin_isinf: {
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success(Val.isInfinity() ? 1 : 0, E);
+    }
+
+    case Builtin::BI__builtin_isfinite: {
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success(Val.isFinite() ? 1 : 0, E);
+    }
+
+    case Builtin::BI__builtin_isnan: {
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success(Val.isNaN() ? 1 : 0, E);
+    }
+
+    case Builtin::BI__builtin_isnormal: {
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success(Val.isNormal() ? 1 : 0, E);
+    }
+
+    case Builtin::BI__builtin_issubnormal: {
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success(Val.isDenormal() ? 1 : 0, E);
+    }
+
+    case Builtin::BI__builtin_iszero: {
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success(Val.isZero() ? 1 : 0, E);
+    }
+
+    case Builtin::BI__builtin_signbit:
+    case Builtin::BI__builtin_signbitf:
+    case Builtin::BI__builtin_signbitl: {
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success(Val.isNegative() ? 1 : 0, E);
+    }
+
+    case Builtin::BI__builtin_isgreater:
+    case Builtin::BI__builtin_isgreaterequal:
+    case Builtin::BI__builtin_isless:
+    case Builtin::BI__builtin_islessequal:
+    case Builtin::BI__builtin_islessgreater:
+    case Builtin::BI__builtin_isunordered: {
+      APFloat LHS(0.0);
+      APFloat RHS(0.0);
+      if (!EvaluateFloat(E->getArg(0), LHS, Info) ||
+          !EvaluateFloat(E->getArg(1), RHS, Info))
+        return false;
+
+      return Success(
+          [&] {
+            switch (BuiltinOp) {
+            case Builtin::BI__builtin_isgreater:
+              return LHS > RHS;
+            case Builtin::BI__builtin_isgreaterequal:
+              return LHS >= RHS;
+            case Builtin::BI__builtin_isless:
+              return LHS < RHS;
+            case Builtin::BI__builtin_islessequal:
+              return LHS <= RHS;
+            case Builtin::BI__builtin_islessgreater: {
+              APFloat::cmpResult cmp = LHS.compare(RHS);
+              return cmp == APFloat::cmpResult::cmpLessThan ||
+                     cmp == APFloat::cmpResult::cmpGreaterThan;
+            }
+            case Builtin::BI__builtin_isunordered:
+              return LHS.compare(RHS) == APFloat::cmpResult::cmpUnordered;
+            default:
+              llvm_unreachable("Unexpected builtin ID: Should be a floating "
+                               "point comparison function");
+            }
+          }()
+              ? 1
+              : 0,
+          E);
+    }
+
+    case Builtin::BI__builtin_issignaling: {
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success(Val.isSignaling() ? 1 : 0, E);
+    }
+
+    case Builtin::BI__builtin_isfpclass: {
+      APSInt MaskVal;
+      if (!EvaluateInteger(E->getArg(1), MaskVal, Info))
+        return false;
+      unsigned Test = static_cast<llvm::FPClassTest>(MaskVal.getZExtValue());
+      APFloat Val(0.0);
+      return EvaluateFloat(E->getArg(0), Val, Info) &&
+             Success((Val.classify() & Test) ? 1 : 0, E);
+    }
+
+    case Builtin::BI__builtin_parity:
+    case Builtin::BI__builtin_parityl:
+    case Builtin::BI__builtin_parityll: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+
+      return Success(Val.popcount() % 2, E);
+    }
+
+    case Builtin::BI__builtin_abs:
+    case Builtin::BI__builtin_labs:
+    case Builtin::BI__builtin_llabs: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+      if (Val == APSInt(APInt::getSignedMinValue(Val.getBitWidth()),
+                        /*IsUnsigned=*/false))
+        return false;
+      if (Val.isNegative())
+        Val.negate();
+      return Success(Val, E);
+    }
+
+    case Builtin::BI__builtin_popcount:
+    case Builtin::BI__builtin_popcountl:
+    case Builtin::BI__builtin_popcountll:
+    case Builtin::BI__builtin_popcountg:
+    case Builtin::BI__builtin_elementwise_popcount:
+    case Builtin::BI__popcnt16: // Microsoft variants of popcount
+    case Builtin::BI__popcnt:
+    case Builtin::BI__popcnt64: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+
+      return Success(Val.popcount(), E);
+    }
+
+    case Builtin::BI__builtin_rotateleft8:
+    case Builtin::BI__builtin_rotateleft16:
+    case Builtin::BI__builtin_rotateleft32:
+    case Builtin::BI__builtin_rotateleft64:
+    case Builtin::BI_rotl8: // Microsoft variants of rotate right
+    case Builtin::BI_rotl16:
+    case Builtin::BI_rotl:
+    case Builtin::BI_lrotl:
+    case Builtin::BI_rotl64: {
+      APSInt Val, Amt;
+      if (!EvaluateInteger(E->getArg(0), Val, Info) ||
+          !EvaluateInteger(E->getArg(1), Amt, Info))
+        return false;
+
+      return Success(Val.rotl(Amt.urem(Val.getBitWidth())), E);
+    }
+
+    case Builtin::BI__builtin_rotateright8:
+    case Builtin::BI__builtin_rotateright16:
+    case Builtin::BI__builtin_rotateright32:
+    case Builtin::BI__builtin_rotateright64:
+    case Builtin::BI_rotr8: // Microsoft variants of rotate right
+    case Builtin::BI_rotr16:
+    case Builtin::BI_rotr:
+    case Builtin::BI_lrotr:
+    case Builtin::BI_rotr64: {
+      APSInt Val, Amt;
+      if (!EvaluateInteger(E->getArg(0), Val, Info) ||
+          !EvaluateInteger(E->getArg(1), Amt, Info))
+        return false;
+
+      return Success(Val.rotr(Amt.urem(Val.getBitWidth())), E);
+    }
+
+    case Builtin::BI__builtin_elementwise_add_sat: {
+      APSInt LHS, RHS;
+      if (!EvaluateInteger(E->getArg(0), LHS, Info) ||
+          !EvaluateInteger(E->getArg(1), RHS, Info))
+        return false;
+
+      APInt Result = LHS.isSigned() ? LHS.sadd_sat(RHS) : LHS.uadd_sat(RHS);
+      return Success(APSInt(Result, !LHS.isSigned()), E);
+    }
+    case Builtin::BI__builtin_elementwise_sub_sat: {
+      APSInt LHS, RHS;
+      if (!EvaluateInteger(E->getArg(0), LHS, Info) ||
+          !EvaluateInteger(E->getArg(1), RHS, Info))
+        return false;
+
+      APInt Result = LHS.isSigned() ? LHS.ssub_sat(RHS) : LHS.usub_sat(RHS);
+      return Success(APSInt(Result, !LHS.isSigned()), E);
+    }
+
+    case Builtin::BIstrlen:
+    case Builtin::BIwcslen:
+      // A call to strlen is not a constant expression.
+      if (Info.getLangOpts().CPlusPlus11)
+        Info.CCEDiag(E, diag::note_constexpr_invalid_function)
+            << /*isConstexpr*/ 0 << /*isConstructor*/ 0
+            << Info.Ctx.BuiltinInfo.getQuotedName(BuiltinOp);
+      else
+        Info.CCEDiag(E, diag::note_invalid_subexpr_in_const_expr);
+      [[fallthrough]];
+    case Builtin::BI__builtin_strlen:
+    case Builtin::BI__builtin_wcslen: {
+      // As an extension, we support __builtin_strlen() as a constant
+      // expression, and support folding strlen() to a constant.
+      uint64_t StrLen;
+      if (EvaluateBuiltinStrLen(E->getArg(0), StrLen, Info))
+        return Success(StrLen, E);
+      return false;
+    }
+
+    case Builtin::BIstrcmp:
+    case Builtin::BIwcscmp:
+    case Builtin::BIstrncmp:
+    case Builtin::BIwcsncmp:
+    case Builtin::BImemcmp:
+    case Builtin::BIbcmp:
+    case Builtin::BIwmemcmp:
+      // A call to strlen is not a constant expression.
+      if (Info.getLangOpts().CPlusPlus11)
+        Info.CCEDiag(E, diag::note_constexpr_invalid_function)
+            << /*isConstexpr*/ 0 << /*isConstructor*/ 0
+            << Info.Ctx.BuiltinInfo.getQuotedName(BuiltinOp);
+      else
+        Info.CCEDiag(E, diag::note_invalid_subexpr_in_const_expr);
+      [[fallthrough]];
+    case Builtin::BI__builtin_strcmp:
+    case Builtin::BI__builtin_wcscmp:
+    case Builtin::BI__builtin_strncmp:
+    case Builtin::BI__builtin_wcsncmp:
+    case Builtin::BI__builtin_memcmp:
+    case Builtin::BI__builtin_bcmp:
+    case Builtin::BI__builtin_wmemcmp: {
+      LValue String1, String2;
+      if (!EvaluatePointer(E->getArg(0), String1, Info) ||
+          !EvaluatePointer(E->getArg(1), String2, Info))
+        return false;
+
+      uint64_t MaxLength = uint64_t(-1);
+      if (BuiltinOp != Builtin::BIstrcmp && BuiltinOp != Builtin::BIwcscmp &&
+          BuiltinOp != Builtin::BI__builtin_strcmp &&
+          BuiltinOp != Builtin::BI__builtin_wcscmp) {
+        APSInt N;
+        if (!EvaluateInteger(E->getArg(2), N, Info))
+          return false;
+        MaxLength = N.getZExtValue();
+      }
+
+      // Empty substrings compare equal by definition.
+      if (MaxLength == 0u)
+        return Success(0, E);
+
+      if (!String1.checkNullPointerForFoldAccess(Info, E, AK_Read) ||
+          !String2.checkNullPointerForFoldAccess(Info, E, AK_Read) ||
+          String1.Designator.Invalid || String2.Designator.Invalid)
+        return false;
+
+      QualType CharTy1 = String1.Designator.getType(Info.Ctx);
+      QualType CharTy2 = String2.Designator.getType(Info.Ctx);
+
+      bool IsRawByte = BuiltinOp == Builtin::BImemcmp ||
+                       BuiltinOp == Builtin::BIbcmp ||
+                       BuiltinOp == Builtin::BI__builtin_memcmp ||
+                       BuiltinOp == Builtin::BI__builtin_bcmp;
+
+      assert(IsRawByte ||
+             (Info.Ctx.hasSameUnqualifiedType(
+                  CharTy1, E->getArg(0)->getType()->getPointeeType()) &&
+              Info.Ctx.hasSameUnqualifiedType(CharTy1, CharTy2)));
+
+      // For memcmp, allow comparing any arrays of '[[un]signed] char' or
+      // 'char8_t', but no other types.
+      if (IsRawByte && !(isOneByteCharacterType(CharTy1) &&
+                         isOneByteCharacterType(CharTy2))) {
+        // FIXME: Consider using our bit_cast implementation to support this.
+        Info.FFDiag(E, diag::note_constexpr_memcmp_unsupported)
+            << Info.Ctx.BuiltinInfo.getQuotedName(BuiltinOp) << CharTy1
+            << CharTy2;
+        return false;
+      }
+
+      const auto &ReadCurElems = [&](APValue &Char1, APValue &Char2) {
+        return handleLValueToRValueConversion(Info, E, CharTy1, String1,
+                                              Char1) &&
+               handleLValueToRValueConversion(Info, E, CharTy2, String2,
+                                              Char2) &&
+               Char1.isInt() && Char2.isInt();
+      };
+      const auto &AdvanceElems = [&] {
+        return HandleLValueArrayAdjustment(Info, E, String1, CharTy1, 1) &&
+               HandleLValueArrayAdjustment(Info, E, String2, CharTy2, 1);
+      };
+
+      bool StopAtNull =
+          (BuiltinOp != Builtin::BImemcmp && BuiltinOp != Builtin::BIbcmp &&
+           BuiltinOp != Builtin::BIwmemcmp &&
+           BuiltinOp != Builtin::BI__builtin_memcmp &&
+           BuiltinOp != Builtin::BI__builtin_bcmp &&
+           BuiltinOp != Builtin::BI__builtin_wmemcmp);
+      bool IsWide = BuiltinOp == Builtin::BIwcscmp ||
+                    BuiltinOp == Builtin::BIwcsncmp ||
+                    BuiltinOp == Builtin::BIwmemcmp ||
+                    BuiltinOp == Builtin::BI__builtin_wcscmp ||
+                    BuiltinOp == Builtin::BI__builtin_wcsncmp ||
+                    BuiltinOp == Builtin::BI__builtin_wmemcmp;
+
+      for (; MaxLength; --MaxLength) {
+        APValue Char1, Char2;
+        if (!ReadCurElems(Char1, Char2))
+          return false;
+        if (Char1.getInt().ne(Char2.getInt())) {
+          if (IsWide) // wmemcmp compares with wchar_t signedness.
+            return Success(Char1.getInt() < Char2.getInt() ? -1 : 1, E);
+          // memcmp always compares unsigned chars.
+          return Success(Char1.getInt().ult(Char2.getInt()) ? -1 : 1, E);
+        }
+        if (StopAtNull && !Char1.getInt())
+          return Success(0, E);
+        assert(!(StopAtNull && !Char2.getInt()));
+        if (!AdvanceElems())
+          return false;
+      }
+      // We hit the strncmp / memcmp limit.
+      return Success(0, E);
+    }
+
+    case Builtin::BI__atomic_always_lock_free:
+    case Builtin::BI__atomic_is_lock_free:
+    case Builtin::BI__c11_atomic_is_lock_free: {
+      APSInt SizeVal;
+      if (!EvaluateInteger(E->getArg(0), SizeVal, Info))
+        return false;
+
+      // For __atomic_is_lock_free(sizeof(_Atomic(T))), if the size is a power
+      // of two less than or equal to the maximum inline atomic width, we know
+      // it is lock-free.  If the size isn't a power of two, or greater than the
+      // maximum alignment where we promote atomics, we know it is not lock-free
+      // (at least not in the sense of atomic_is_lock_free).  Otherwise,
+      // the answer can only be determined at runtime; for example, 16-byte
+      // atomics have lock-free implementations on some, but not all,
+      // x86-64 processors.
+
+      // Check power-of-two.
+      CharUnits Size = CharUnits::fromQuantity(SizeVal.getZExtValue());
+      if (Size.isPowerOfTwo()) {
+        // Check against inlining width.
+        unsigned InlineWidthBits =
+            Info.Ctx.getTargetInfo().getMaxAtomicInlineWidth();
+        if (Size <= Info.Ctx.toCharUnitsFromBits(InlineWidthBits)) {
+          if (BuiltinOp == Builtin::BI__c11_atomic_is_lock_free ||
+              Size == CharUnits::One())
+            return Success(1, E);
+
+          // If the pointer argument can be evaluated to a compile-time constant
+          // integer (or nullptr), check if that value is appropriately aligned.
+          const Expr *PtrArg = E->getArg(1);
+          Expr::EvalResult ExprResult;
+          APSInt IntResult;
+          if (PtrArg->EvaluateAsRValue(ExprResult, Info.Ctx) &&
+              ExprResult.Val.toIntegralConstant(IntResult, PtrArg->getType(),
+                                                Info.Ctx) &&
+              IntResult.isAligned(Size.getAsAlign()))
+            return Success(1, E);
+
+          // Otherwise, check if the type's alignment against Size.
+          if (auto *ICE = dyn_cast<ImplicitCastExpr>(PtrArg)) {
+            // Drop the potential implicit-cast to 'const volatile void*',
+            // getting the underlying type.
+            if (ICE->getCastKind() == CK_BitCast)
+              PtrArg = ICE->getSubExpr();
+          }
+
+          if (auto PtrTy = PtrArg->getType()->getAs<PointerType>()) {
+            QualType PointeeType = PtrTy->getPointeeType();
+            if (!PointeeType->isIncompleteType() &&
+                Info.Ctx.getTypeAlignInChars(PointeeType) >= Size) {
+              // OK, we will inline operations on this object.
+              return Success(1, E);
+            }
+          }
+        }
+      }
+
+      return BuiltinOp == Builtin::BI__atomic_always_lock_free ? Success(0, E)
+                                                               : Error(E);
+    }
     case Builtin::BI__builtin_addcb:
     case Builtin::BI__builtin_addcs:
     case Builtin::BI__builtin_addc:
     case Builtin::BI__builtin_addcl:
     case Builtin::BI__builtin_addcll:
-      Result =
-          LHS.uadd_ov(RHS, FirstOverflowed).uadd_ov(CarryIn, SecondOverflowed);
-      break;
     case Builtin::BI__builtin_subcb:
     case Builtin::BI__builtin_subcs:
     case Builtin::BI__builtin_subc:
     case Builtin::BI__builtin_subcl:
-    case Builtin::BI__builtin_subcll:
-      Result =
-          LHS.usub_ov(RHS, FirstOverflowed).usub_ov(CarryIn, SecondOverflowed);
-      break;
+    case Builtin::BI__builtin_subcll: {
+      LValue CarryOutLValue;
+      APSInt LHS, RHS, CarryIn, CarryOut, Result;
+      QualType ResultType = E->getArg(0)->getType();
+      if (!EvaluateInteger(E->getArg(0), LHS, Info) ||
+          !EvaluateInteger(E->getArg(1), RHS, Info) ||
+          !EvaluateInteger(E->getArg(2), CarryIn, Info) ||
+          !EvaluatePointer(E->getArg(3), CarryOutLValue, Info))
+        return false;
+      // Copy the number of bits and sign.
+      Result = LHS;
+      CarryOut = LHS;
+
+      bool FirstOverflowed = false;
+      bool SecondOverflowed = false;
+      switch (BuiltinOp) {
+      default:
+        llvm_unreachable("Invalid value for BuiltinOp");
+      case Builtin::BI__builtin_addcb:
+      case Builtin::BI__builtin_addcs:
+      case Builtin::BI__builtin_addc:
+      case Builtin::BI__builtin_addcl:
+      case Builtin::BI__builtin_addcll:
+        Result = LHS.uadd_ov(RHS, FirstOverflowed)
+                     .uadd_ov(CarryIn, SecondOverflowed);
+        break;
+      case Builtin::BI__builtin_subcb:
+      case Builtin::BI__builtin_subcs:
+      case Builtin::BI__builtin_subc:
+      case Builtin::BI__builtin_subcl:
+      case Builtin::BI__builtin_subcll:
+        Result = LHS.usub_ov(RHS, FirstOverflowed)
+                     .usub_ov(CarryIn, SecondOverflowed);
+        break;
+      }
+
+      // It is possible for both overflows to happen but CGBuiltin uses an OR so
+      // this is consistent.
+      CarryOut = (uint64_t)(FirstOverflowed | SecondOverflowed);
+      APValue APV{CarryOut};
+      if (!handleAssignment(Info, E, CarryOutLValue, ResultType, APV))
+        return false;
+      return Success(Result, E);
     }
-
-    // It is possible for both overflows to happen but CGBuiltin uses an OR so
-    // this is consistent.
-    CarryOut = (uint64_t)(FirstOverflowed | SecondOverflowed);
-    APValue APV{CarryOut};
-    if (!handleAssignment(Info, E, CarryOutLValue, ResultType, APV))
-      return false;
-    return Success(Result, E);
-  }
-  case Builtin::BI__builtin_add_overflow:
-  case Builtin::BI__builtin_sub_overflow:
-  case Builtin::BI__builtin_mul_overflow:
-  case Builtin::BI__builtin_sadd_overflow:
-  case Builtin::BI__builtin_uadd_overflow:
-  case Builtin::BI__builtin_uaddl_overflow:
-  case Builtin::BI__builtin_uaddll_overflow:
-  case Builtin::BI__builtin_usub_overflow:
-  case Builtin::BI__builtin_usubl_overflow:
-  case Builtin::BI__builtin_usubll_overflow:
-  case Builtin::BI__builtin_umul_overflow:
-  case Builtin::BI__builtin_umull_overflow:
-  case Builtin::BI__builtin_umulll_overflow:
-  case Builtin::BI__builtin_saddl_overflow:
-  case Builtin::BI__builtin_saddll_overflow:
-  case Builtin::BI__builtin_ssub_overflow:
-  case Builtin::BI__builtin_ssubl_overflow:
-  case Builtin::BI__builtin_ssubll_overflow:
-  case Builtin::BI__builtin_smul_overflow:
-  case Builtin::BI__builtin_smull_overflow:
-  case Builtin::BI__builtin_smulll_overflow: {
-    LValue ResultLValue;
-    APSInt LHS, RHS;
-
-    QualType ResultType = E->getArg(2)->getType()->getPointeeType();
-    if (!EvaluateInteger(E->getArg(0), LHS, Info) ||
-        !EvaluateInteger(E->getArg(1), RHS, Info) ||
-        !EvaluatePointer(E->getArg(2), ResultLValue, Info))
-      return false;
-
-    APSInt Result;
-    bool DidOverflow = false;
-
-    // If the types don't have to match, enlarge all 3 to the largest of them.
-    if (BuiltinOp == Builtin::BI__builtin_add_overflow ||
-        BuiltinOp == Builtin::BI__builtin_sub_overflow ||
-        BuiltinOp == Builtin::BI__builtin_mul_overflow) {
-      bool IsSigned = LHS.isSigned() || RHS.isSigned() ||
-                      ResultType->isSignedIntegerOrEnumerationType();
-      bool AllSigned = LHS.isSigned() && RHS.isSigned() &&
-                      ResultType->isSignedIntegerOrEnumerationType();
-      uint64_t LHSSize = LHS.getBitWidth();
-      uint64_t RHSSize = RHS.getBitWidth();
-      uint64_t ResultSize = Info.Ctx.getTypeSize(ResultType);
-      uint64_t MaxBits = std::max(std::max(LHSSize, RHSSize), ResultSize);
-
-      // Add an additional bit if the signedness isn't uniformly agreed to. We
-      // could do this ONLY if there is a signed and an unsigned that both have
-      // MaxBits, but the code to check that is pretty nasty.  The issue will be
-      // caught in the shrink-to-result later anyway.
-      if (IsSigned && !AllSigned)
-        ++MaxBits;
-
-      LHS = APSInt(LHS.extOrTrunc(MaxBits), !IsSigned);
-      RHS = APSInt(RHS.extOrTrunc(MaxBits), !IsSigned);
-      Result = APSInt(MaxBits, !IsSigned);
-    }
-
-    // Find largest int.
-    switch (BuiltinOp) {
-    default:
-      llvm_unreachable("Invalid value for BuiltinOp");
     case Builtin::BI__builtin_add_overflow:
+    case Builtin::BI__builtin_sub_overflow:
+    case Builtin::BI__builtin_mul_overflow:
     case Builtin::BI__builtin_sadd_overflow:
-    case Builtin::BI__builtin_saddl_overflow:
-    case Builtin::BI__builtin_saddll_overflow:
     case Builtin::BI__builtin_uadd_overflow:
     case Builtin::BI__builtin_uaddl_overflow:
     case Builtin::BI__builtin_uaddll_overflow:
-      Result = LHS.isSigned() ? LHS.sadd_ov(RHS, DidOverflow)
-                              : LHS.uadd_ov(RHS, DidOverflow);
-      break;
-    case Builtin::BI__builtin_sub_overflow:
-    case Builtin::BI__builtin_ssub_overflow:
-    case Builtin::BI__builtin_ssubl_overflow:
-    case Builtin::BI__builtin_ssubll_overflow:
     case Builtin::BI__builtin_usub_overflow:
     case Builtin::BI__builtin_usubl_overflow:
     case Builtin::BI__builtin_usubll_overflow:
-      Result = LHS.isSigned() ? LHS.ssub_ov(RHS, DidOverflow)
-                              : LHS.usub_ov(RHS, DidOverflow);
-      break;
-    case Builtin::BI__builtin_mul_overflow:
-    case Builtin::BI__builtin_smul_overflow:
-    case Builtin::BI__builtin_smull_overflow:
-    case Builtin::BI__builtin_smulll_overflow:
     case Builtin::BI__builtin_umul_overflow:
     case Builtin::BI__builtin_umull_overflow:
     case Builtin::BI__builtin_umulll_overflow:
-      Result = LHS.isSigned() ? LHS.smul_ov(RHS, DidOverflow)
-                              : LHS.umul_ov(RHS, DidOverflow);
-      break;
-    }
+    case Builtin::BI__builtin_saddl_overflow:
+    case Builtin::BI__builtin_saddll_overflow:
+    case Builtin::BI__builtin_ssub_overflow:
+    case Builtin::BI__builtin_ssubl_overflow:
+    case Builtin::BI__builtin_ssubll_overflow:
+    case Builtin::BI__builtin_smul_overflow:
+    case Builtin::BI__builtin_smull_overflow:
+    case Builtin::BI__builtin_smulll_overflow: {
+      LValue ResultLValue;
+      APSInt LHS, RHS;
 
-    // In the case where multiple sizes are allowed, truncate and see if
-    // the values are the same.
-    if (BuiltinOp == Builtin::BI__builtin_add_overflow ||
-        BuiltinOp == Builtin::BI__builtin_sub_overflow ||
-        BuiltinOp == Builtin::BI__builtin_mul_overflow) {
-      // APSInt doesn't have a TruncOrSelf, so we use extOrTrunc instead,
-      // since it will give us the behavior of a TruncOrSelf in the case where
-      // its parameter <= its size.  We previously set Result to be at least the
-      // type-size of the result, so getTypeSize(ResultType) <= Result.BitWidth
-      // will work exactly like TruncOrSelf.
-      APSInt Temp = Result.extOrTrunc(Info.Ctx.getTypeSize(ResultType));
-      Temp.setIsSigned(ResultType->isSignedIntegerOrEnumerationType());
+      QualType ResultType = E->getArg(2)->getType()->getPointeeType();
+      if (!EvaluateInteger(E->getArg(0), LHS, Info) ||
+          !EvaluateInteger(E->getArg(1), RHS, Info) ||
+          !EvaluatePointer(E->getArg(2), ResultLValue, Info))
+        return false;
 
-      if (!APSInt::isSameValue(Temp, Result))
-        DidOverflow = true;
-      Result = Temp;
-    }
+      APSInt Result;
+      bool DidOverflow = false;
 
-    APValue APV{Result};
-    if (!handleAssignment(Info, E, ResultLValue, ResultType, APV))
-      return false;
-    return Success(DidOverflow, E);
-  }
+      // If the types don't have to match, enlarge all 3 to the largest of them.
+      if (BuiltinOp == Builtin::BI__builtin_add_overflow ||
+          BuiltinOp == Builtin::BI__builtin_sub_overflow ||
+          BuiltinOp == Builtin::BI__builtin_mul_overflow) {
+        bool IsSigned = LHS.isSigned() || RHS.isSigned() ||
+                        ResultType->isSignedIntegerOrEnumerationType();
+        bool AllSigned = LHS.isSigned() && RHS.isSigned() &&
+                         ResultType->isSignedIntegerOrEnumerationType();
+        uint64_t LHSSize = LHS.getBitWidth();
+        uint64_t RHSSize = RHS.getBitWidth();
+        uint64_t ResultSize = Info.Ctx.getTypeSize(ResultType);
+        uint64_t MaxBits = std::max(std::max(LHSSize, RHSSize), ResultSize);
 
-  case Builtin::BI__builtin_reduce_add:
-  case Builtin::BI__builtin_reduce_mul:
-  case Builtin::BI__builtin_reduce_and:
-  case Builtin::BI__builtin_reduce_or:
-  case Builtin::BI__builtin_reduce_xor:
-  case Builtin::BI__builtin_reduce_min:
-  case Builtin::BI__builtin_reduce_max: {
-    APValue Source;
-    if (!EvaluateAsRValue(Info, E->getArg(0), Source))
-      return false;
+        // Add an additional bit if the signedness isn't uniformly agreed to. We
+        // could do this ONLY if there is a signed and an unsigned that both
+        // have MaxBits, but the code to check that is pretty nasty.  The issue
+        // will be caught in the shrink-to-result later anyway.
+        if (IsSigned && !AllSigned)
+          ++MaxBits;
 
-    unsigned SourceLen = Source.getVectorLength();
-    APSInt Reduced = Source.getVectorElt(0).getInt();
-    for (unsigned EltNum = 1; EltNum < SourceLen; ++EltNum) {
+        LHS = APSInt(LHS.extOrTrunc(MaxBits), !IsSigned);
+        RHS = APSInt(RHS.extOrTrunc(MaxBits), !IsSigned);
+        Result = APSInt(MaxBits, !IsSigned);
+      }
+
+      // Find largest int.
       switch (BuiltinOp) {
       default:
+        llvm_unreachable("Invalid value for BuiltinOp");
+      case Builtin::BI__builtin_add_overflow:
+      case Builtin::BI__builtin_sadd_overflow:
+      case Builtin::BI__builtin_saddl_overflow:
+      case Builtin::BI__builtin_saddll_overflow:
+      case Builtin::BI__builtin_uadd_overflow:
+      case Builtin::BI__builtin_uaddl_overflow:
+      case Builtin::BI__builtin_uaddll_overflow:
+        Result = LHS.isSigned() ? LHS.sadd_ov(RHS, DidOverflow)
+                                : LHS.uadd_ov(RHS, DidOverflow);
+        break;
+      case Builtin::BI__builtin_sub_overflow:
+      case Builtin::BI__builtin_ssub_overflow:
+      case Builtin::BI__builtin_ssubl_overflow:
+      case Builtin::BI__builtin_ssubll_overflow:
+      case Builtin::BI__builtin_usub_overflow:
+      case Builtin::BI__builtin_usubl_overflow:
+      case Builtin::BI__builtin_usubll_overflow:
+        Result = LHS.isSigned() ? LHS.ssub_ov(RHS, DidOverflow)
+                                : LHS.usub_ov(RHS, DidOverflow);
+        break;
+      case Builtin::BI__builtin_mul_overflow:
+      case Builtin::BI__builtin_smul_overflow:
+      case Builtin::BI__builtin_smull_overflow:
+      case Builtin::BI__builtin_smulll_overflow:
+      case Builtin::BI__builtin_umul_overflow:
+      case Builtin::BI__builtin_umull_overflow:
+      case Builtin::BI__builtin_umulll_overflow:
+        Result = LHS.isSigned() ? LHS.smul_ov(RHS, DidOverflow)
+                                : LHS.umul_ov(RHS, DidOverflow);
+        break;
+      }
+
+      // In the case where multiple sizes are allowed, truncate and see if
+      // the values are the same.
+      if (BuiltinOp == Builtin::BI__builtin_add_overflow ||
+          BuiltinOp == Builtin::BI__builtin_sub_overflow ||
+          BuiltinOp == Builtin::BI__builtin_mul_overflow) {
+        // APSInt doesn't have a TruncOrSelf, so we use extOrTrunc instead,
+        // since it will give us the behavior of a TruncOrSelf in the case where
+        // its parameter <= its size.  We previously set Result to be at least
+        // the type-size of the result, so getTypeSize(ResultType) <=
+        // Result.BitWidth will work exactly like TruncOrSelf.
+        APSInt Temp = Result.extOrTrunc(Info.Ctx.getTypeSize(ResultType));
+        Temp.setIsSigned(ResultType->isSignedIntegerOrEnumerationType());
+
+        if (!APSInt::isSameValue(Temp, Result))
+          DidOverflow = true;
+        Result = Temp;
+      }
+
+      APValue APV{Result};
+      if (!handleAssignment(Info, E, ResultLValue, ResultType, APV))
         return false;
-      case Builtin::BI__builtin_reduce_add: {
-        if (!CheckedIntArithmetic(
-                Info, E, Reduced, Source.getVectorElt(EltNum).getInt(),
-                Reduced.getBitWidth() + 1, std::plus<APSInt>(), Reduced))
-          return false;
-        break;
-      }
-      case Builtin::BI__builtin_reduce_mul: {
-        if (!CheckedIntArithmetic(
-                Info, E, Reduced, Source.getVectorElt(EltNum).getInt(),
-                Reduced.getBitWidth() * 2, std::multiplies<APSInt>(), Reduced))
-          return false;
-        break;
-      }
-      case Builtin::BI__builtin_reduce_and: {
-        Reduced &= Source.getVectorElt(EltNum).getInt();
-        break;
-      }
-      case Builtin::BI__builtin_reduce_or: {
-        Reduced |= Source.getVectorElt(EltNum).getInt();
-        break;
-      }
-      case Builtin::BI__builtin_reduce_xor: {
-        Reduced ^= Source.getVectorElt(EltNum).getInt();
-        break;
-      }
-      case Builtin::BI__builtin_reduce_min: {
-        Reduced = std::min(Reduced, Source.getVectorElt(EltNum).getInt());
-        break;
-      }
-      case Builtin::BI__builtin_reduce_max: {
-        Reduced = std::max(Reduced, Source.getVectorElt(EltNum).getInt());
-        break;
-      }
-      }
+      return Success(DidOverflow, E);
     }
 
-    return Success(Reduced, E);
-  }
+    case Builtin::BI__builtin_reduce_add:
+    case Builtin::BI__builtin_reduce_mul:
+    case Builtin::BI__builtin_reduce_and:
+    case Builtin::BI__builtin_reduce_or:
+    case Builtin::BI__builtin_reduce_xor:
+    case Builtin::BI__builtin_reduce_min:
+    case Builtin::BI__builtin_reduce_max: {
+      APValue Source;
+      if (!EvaluateAsRValue(Info, E->getArg(0), Source))
+        return false;
 
-  case clang::X86::BI__builtin_ia32_addcarryx_u32:
-  case clang::X86::BI__builtin_ia32_addcarryx_u64:
-  case clang::X86::BI__builtin_ia32_subborrow_u32:
-  case clang::X86::BI__builtin_ia32_subborrow_u64: {
-    LValue ResultLValue;
-    APSInt CarryIn, LHS, RHS;
-    QualType ResultType = E->getArg(3)->getType()->getPointeeType();
-    if (!EvaluateInteger(E->getArg(0), CarryIn, Info) ||
-        !EvaluateInteger(E->getArg(1), LHS, Info) ||
-        !EvaluateInteger(E->getArg(2), RHS, Info) ||
-        !EvaluatePointer(E->getArg(3), ResultLValue, Info))
-      return false;
+      unsigned SourceLen = Source.getVectorLength();
+      APSInt Reduced = Source.getVectorElt(0).getInt();
+      for (unsigned EltNum = 1; EltNum < SourceLen; ++EltNum) {
+        switch (BuiltinOp) {
+        default:
+          return false;
+        case Builtin::BI__builtin_reduce_add: {
+          if (!CheckedIntArithmetic(
+                  Info, E, Reduced, Source.getVectorElt(EltNum).getInt(),
+                  Reduced.getBitWidth() + 1, std::plus<APSInt>(), Reduced))
+            return false;
+          break;
+        }
+        case Builtin::BI__builtin_reduce_mul: {
+          if (!CheckedIntArithmetic(Info, E, Reduced,
+                                    Source.getVectorElt(EltNum).getInt(),
+                                    Reduced.getBitWidth() * 2,
+                                    std::multiplies<APSInt>(), Reduced))
+            return false;
+          break;
+        }
+        case Builtin::BI__builtin_reduce_and: {
+          Reduced &= Source.getVectorElt(EltNum).getInt();
+          break;
+        }
+        case Builtin::BI__builtin_reduce_or: {
+          Reduced |= Source.getVectorElt(EltNum).getInt();
+          break;
+        }
+        case Builtin::BI__builtin_reduce_xor: {
+          Reduced ^= Source.getVectorElt(EltNum).getInt();
+          break;
+        }
+        case Builtin::BI__builtin_reduce_min: {
+          Reduced = std::min(Reduced, Source.getVectorElt(EltNum).getInt());
+          break;
+        }
+        case Builtin::BI__builtin_reduce_max: {
+          Reduced = std::max(Reduced, Source.getVectorElt(EltNum).getInt());
+          break;
+        }
+        }
+      }
 
-    bool IsAdd = BuiltinOp == clang::X86::BI__builtin_ia32_addcarryx_u32 ||
-                 BuiltinOp == clang::X86::BI__builtin_ia32_addcarryx_u64;
-
-    unsigned BitWidth = LHS.getBitWidth();
-    unsigned CarryInBit = CarryIn.ugt(0) ? 1 : 0;
-    APInt ExResult =
-        IsAdd
-            ? (LHS.zext(BitWidth + 1) + (RHS.zext(BitWidth + 1) + CarryInBit))
-            : (LHS.zext(BitWidth + 1) - (RHS.zext(BitWidth + 1) + CarryInBit));
-
-    APInt Result = ExResult.extractBits(BitWidth, 0);
-    uint64_t CarryOut = ExResult.extractBitsAsZExtValue(1, BitWidth);
-
-    APValue APV{APSInt(Result, /*isUnsigned=*/true)};
-    if (!handleAssignment(Info, E, ResultLValue, ResultType, APV))
-      return false;
-    return Success(CarryOut, E);
-  }
-
-  case clang::X86::BI__builtin_ia32_bextr_u32:
-  case clang::X86::BI__builtin_ia32_bextr_u64:
-  case clang::X86::BI__builtin_ia32_bextri_u32:
-  case clang::X86::BI__builtin_ia32_bextri_u64: {
-    APSInt Val, Idx;
-    if (!EvaluateInteger(E->getArg(0), Val, Info) ||
-        !EvaluateInteger(E->getArg(1), Idx, Info))
-      return false;
-
-    unsigned BitWidth = Val.getBitWidth();
-    uint64_t Shift = Idx.extractBitsAsZExtValue(8, 0);
-    uint64_t Length = Idx.extractBitsAsZExtValue(8, 8);
-    Length = Length > BitWidth ? BitWidth : Length;
-
-    // Handle out of bounds cases.
-    if (Length == 0 || Shift >= BitWidth)
-      return Success(0, E);
-
-    uint64_t Result = Val.getZExtValue() >> Shift;
-    Result &= llvm::maskTrailingOnes<uint64_t>(Length);
-    return Success(Result, E);
-  }
-
-  case clang::X86::BI__builtin_ia32_bzhi_si:
-  case clang::X86::BI__builtin_ia32_bzhi_di: {
-    APSInt Val, Idx;
-    if (!EvaluateInteger(E->getArg(0), Val, Info) ||
-        !EvaluateInteger(E->getArg(1), Idx, Info))
-      return false;
-
-    unsigned BitWidth = Val.getBitWidth();
-    unsigned Index = Idx.extractBitsAsZExtValue(8, 0);
-    if (Index < BitWidth)
-      Val.clearHighBits(BitWidth - Index);
-    return Success(Val, E);
-  }
-
-  case clang::X86::BI__builtin_ia32_lzcnt_u16:
-  case clang::X86::BI__builtin_ia32_lzcnt_u32:
-  case clang::X86::BI__builtin_ia32_lzcnt_u64: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-    return Success(Val.countLeadingZeros(), E);
-  }
-
-  case clang::X86::BI__builtin_ia32_tzcnt_u16:
-  case clang::X86::BI__builtin_ia32_tzcnt_u32:
-  case clang::X86::BI__builtin_ia32_tzcnt_u64: {
-    APSInt Val;
-    if (!EvaluateInteger(E->getArg(0), Val, Info))
-      return false;
-    return Success(Val.countTrailingZeros(), E);
-  }
-
-  case clang::X86::BI__builtin_ia32_pdep_si:
-  case clang::X86::BI__builtin_ia32_pdep_di: {
-    APSInt Val, Msk;
-    if (!EvaluateInteger(E->getArg(0), Val, Info) ||
-        !EvaluateInteger(E->getArg(1), Msk, Info))
-      return false;
-
-    unsigned BitWidth = Val.getBitWidth();
-    APInt Result = APInt::getZero(BitWidth);
-    for (unsigned I = 0, P = 0; I != BitWidth; ++I)
-      if (Msk[I])
-        Result.setBitVal(I, Val[P++]);
-    return Success(Result, E);
-  }
-
-  case clang::X86::BI__builtin_ia32_pext_si:
-  case clang::X86::BI__builtin_ia32_pext_di: {
-    APSInt Val, Msk;
-    if (!EvaluateInteger(E->getArg(0), Val, Info) ||
-        !EvaluateInteger(E->getArg(1), Msk, Info))
-      return false;
-
-    unsigned BitWidth = Val.getBitWidth();
-    APInt Result = APInt::getZero(BitWidth);
-    for (unsigned I = 0, P = 0; I != BitWidth; ++I)
-      if (Msk[I])
-        Result.setBitVal(P++, Val[I]);
-    return Success(Result, E);
-  }
-
-  case Builtin::BI__builtin_sycl_is_kernel: {
-    return isSYCLFreeFunctionKernel(*this, Info, E, "sycl-single-task-kernel",
-                                    "sycl-nd-range-kernel");
-  }
-  case Builtin::BI__builtin_sycl_is_single_task_kernel: {
-    return isSYCLFreeFunctionKernel(*this, Info, E, "sycl-single-task-kernel",
-                                    "");
-  }
-  case Builtin::BI__builtin_sycl_is_nd_range_kernel: {
-    return isSYCLFreeFunctionKernel(*this, Info, E, "sycl-nd-range-kernel", "",
-                                    /*CheckNDRangeDim=*/true);
-  }
-  }
-}
-
-/// Determine whether this is a pointer past the end of the complete
-/// object referred to by the lvalue.
-static bool isOnePastTheEndOfCompleteObject(const ASTContext &Ctx,
-                                            const LValue &LV) {
-  // A null pointer can be viewed as being "past the end" but we don't
-  // choose to look at it that way here.
-  if (!LV.getLValueBase())
-    return false;
-
-  // If the designator is valid and refers to a subobject, we're not pointing
-  // past the end.
-  if (!LV.getLValueDesignator().Invalid &&
-      !LV.getLValueDesignator().isOnePastTheEnd())
-    return false;
-
-  // A pointer to an incomplete type might be past-the-end if the type's size is
-  // zero.  We cannot tell because the type is incomplete.
-  QualType Ty = getType(LV.getLValueBase());
-  if (Ty->isIncompleteType())
-    return true;
-
-  // Can't be past the end of an invalid object.
-  if (LV.getLValueDesignator().Invalid)
-    return false;
-
-  // We're a past-the-end pointer if we point to the byte after the object,
-  // no matter what our type or path is.
-  auto Size = Ctx.getTypeSizeInChars(Ty);
-  return LV.getLValueOffset() == Size;
-}
-
-namespace {
-
-/// Data recursive integer evaluator of certain binary operators.
-///
-/// We use a data recursive algorithm for binary operators so that we are able
-/// to handle extreme cases of chained binary operators without causing stack
-/// overflow.
-class DataRecursiveIntBinOpEvaluator {
-  struct EvalResult {
-    APValue Val;
-    bool Failed = false;
-
-    EvalResult() = default;
-
-    void swap(EvalResult &RHS) {
-      Val.swap(RHS.Val);
-      Failed = RHS.Failed;
-      RHS.Failed = false;
+      return Success(Reduced, E);
     }
-  };
 
-  struct Job {
-    const Expr *E;
-    EvalResult LHSResult; // meaningful only for binary operator expression.
-    enum { AnyExprKind, BinOpKind, BinOpVisitedLHSKind } Kind;
+    case clang::X86::BI__builtin_ia32_addcarryx_u32:
+    case clang::X86::BI__builtin_ia32_addcarryx_u64:
+    case clang::X86::BI__builtin_ia32_subborrow_u32:
+    case clang::X86::BI__builtin_ia32_subborrow_u64: {
+      LValue ResultLValue;
+      APSInt CarryIn, LHS, RHS;
+      QualType ResultType = E->getArg(3)->getType()->getPointeeType();
+      if (!EvaluateInteger(E->getArg(0), CarryIn, Info) ||
+          !EvaluateInteger(E->getArg(1), LHS, Info) ||
+          !EvaluateInteger(E->getArg(2), RHS, Info) ||
+          !EvaluatePointer(E->getArg(3), ResultLValue, Info))
+        return false;
 
-    Job() = default;
-    Job(Job &&) = default;
+      bool IsAdd = BuiltinOp == clang::X86::BI__builtin_ia32_addcarryx_u32 ||
+                   BuiltinOp == clang::X86::BI__builtin_ia32_addcarryx_u64;
 
-    void startSpeculativeEval(EvalInfo &Info) {
-      SpecEvalRAII = SpeculativeEvaluationRAII(Info);
+      unsigned BitWidth = LHS.getBitWidth();
+      unsigned CarryInBit = CarryIn.ugt(0) ? 1 : 0;
+      APInt ExResult =
+          IsAdd
+              ? (LHS.zext(BitWidth + 1) + (RHS.zext(BitWidth + 1) + CarryInBit))
+              : (LHS.zext(BitWidth + 1) -
+                 (RHS.zext(BitWidth + 1) + CarryInBit));
+
+      APInt Result = ExResult.extractBits(BitWidth, 0);
+      uint64_t CarryOut = ExResult.extractBitsAsZExtValue(1, BitWidth);
+
+      APValue APV{APSInt(Result, /*isUnsigned=*/true)};
+      if (!handleAssignment(Info, E, ResultLValue, ResultType, APV))
+        return false;
+      return Success(CarryOut, E);
+    }
+
+    case clang::X86::BI__builtin_ia32_bextr_u32:
+    case clang::X86::BI__builtin_ia32_bextr_u64:
+    case clang::X86::BI__builtin_ia32_bextri_u32:
+    case clang::X86::BI__builtin_ia32_bextri_u64: {
+      APSInt Val, Idx;
+      if (!EvaluateInteger(E->getArg(0), Val, Info) ||
+          !EvaluateInteger(E->getArg(1), Idx, Info))
+        return false;
+
+      unsigned BitWidth = Val.getBitWidth();
+      uint64_t Shift = Idx.extractBitsAsZExtValue(8, 0);
+      uint64_t Length = Idx.extractBitsAsZExtValue(8, 8);
+      Length = Length > BitWidth ? BitWidth : Length;
+
+      // Handle out of bounds cases.
+      if (Length == 0 || Shift >= BitWidth)
+        return Success(0, E);
+
+      uint64_t Result = Val.getZExtValue() >> Shift;
+      Result &= llvm::maskTrailingOnes<uint64_t>(Length);
+      return Success(Result, E);
+    }
+
+    case clang::X86::BI__builtin_ia32_bzhi_si:
+    case clang::X86::BI__builtin_ia32_bzhi_di: {
+      APSInt Val, Idx;
+      if (!EvaluateInteger(E->getArg(0), Val, Info) ||
+          !EvaluateInteger(E->getArg(1), Idx, Info))
+        return false;
+
+      unsigned BitWidth = Val.getBitWidth();
+      unsigned Index = Idx.extractBitsAsZExtValue(8, 0);
+      if (Index < BitWidth)
+        Val.clearHighBits(BitWidth - Index);
+      return Success(Val, E);
+    }
+
+    case clang::X86::BI__builtin_ia32_lzcnt_u16:
+    case clang::X86::BI__builtin_ia32_lzcnt_u32:
+    case clang::X86::BI__builtin_ia32_lzcnt_u64: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+      return Success(Val.countLeadingZeros(), E);
+    }
+
+    case clang::X86::BI__builtin_ia32_tzcnt_u16:
+    case clang::X86::BI__builtin_ia32_tzcnt_u32:
+    case clang::X86::BI__builtin_ia32_tzcnt_u64: {
+      APSInt Val;
+      if (!EvaluateInteger(E->getArg(0), Val, Info))
+        return false;
+      return Success(Val.countTrailingZeros(), E);
+    }
+
+    case clang::X86::BI__builtin_ia32_pdep_si:
+    case clang::X86::BI__builtin_ia32_pdep_di: {
+      APSInt Val, Msk;
+      if (!EvaluateInteger(E->getArg(0), Val, Info) ||
+          !EvaluateInteger(E->getArg(1), Msk, Info))
+        return false;
+
+      unsigned BitWidth = Val.getBitWidth();
+      APInt Result = APInt::getZero(BitWidth);
+      for (unsigned I = 0, P = 0; I != BitWidth; ++I)
+        if (Msk[I])
+          Result.setBitVal(I, Val[P++]);
+      return Success(Result, E);
+    }
+
+    case clang::X86::BI__builtin_ia32_pext_si:
+    case clang::X86::BI__builtin_ia32_pext_di: {
+      APSInt Val, Msk;
+      if (!EvaluateInteger(E->getArg(0), Val, Info) ||
+          !EvaluateInteger(E->getArg(1), Msk, Info))
+        return false;
+
+      unsigned BitWidth = Val.getBitWidth();
+      APInt Result = APInt::getZero(BitWidth);
+      for (unsigned I = 0, P = 0; I != BitWidth; ++I)
+        if (Msk[I])
+          Result.setBitVal(P++, Val[I]);
+      return Success(Result, E);
+    }
+
+    case Builtin::BI__builtin_sycl_is_kernel: {
+      return isSYCLFreeFunctionKernel(*this, Info, E, "sycl-single-task-kernel",
+                                      "sycl-nd-range-kernel");
+    }
+    case Builtin::BI__builtin_sycl_is_single_task_kernel: {
+      return isSYCLFreeFunctionKernel(*this, Info, E, "sycl-single-task-kernel",
+                                      "");
+    }
+    case Builtin::BI__builtin_sycl_is_nd_range_kernel: {
+      return isSYCLFreeFunctionKernel(*this, Info, E, "sycl-nd-range-kernel",
+                                      "",
+                                      /*CheckNDRangeDim=*/true);
+    }
+    }
+  }
+
+  /// Determine whether this is a pointer past the end of the complete
+  /// object referred to by the lvalue.
+  static bool isOnePastTheEndOfCompleteObject(const ASTContext &Ctx,
+                                              const LValue &LV) {
+    // A null pointer can be viewed as being "past the end" but we don't
+    // choose to look at it that way here.
+    if (!LV.getLValueBase())
+      return false;
+
+    // If the designator is valid and refers to a subobject, we're not pointing
+    // past the end.
+    if (!LV.getLValueDesignator().Invalid &&
+        !LV.getLValueDesignator().isOnePastTheEnd())
+      return false;
+
+    // A pointer to an incomplete type might be past-the-end if the type's size
+    // is zero.  We cannot tell because the type is incomplete.
+    QualType Ty = getType(LV.getLValueBase());
+    if (Ty->isIncompleteType())
+      return true;
+
+    // Can't be past the end of an invalid object.
+    if (LV.getLValueDesignator().Invalid)
+      return false;
+
+    // We're a past-the-end pointer if we point to the byte after the object,
+    // no matter what our type or path is.
+    auto Size = Ctx.getTypeSizeInChars(Ty);
+    return LV.getLValueOffset() == Size;
+  }
+
+  namespace {
+
+  /// Data recursive integer evaluator of certain binary operators.
+  ///
+  /// We use a data recursive algorithm for binary operators so that we are able
+  /// to handle extreme cases of chained binary operators without causing stack
+  /// overflow.
+  class DataRecursiveIntBinOpEvaluator {
+    struct EvalResult {
+      APValue Val;
+      bool Failed = false;
+
+      EvalResult() = default;
+
+      void swap(EvalResult &RHS) {
+        Val.swap(RHS.Val);
+        Failed = RHS.Failed;
+        RHS.Failed = false;
+      }
+    };
+
+    struct Job {
+      const Expr *E;
+      EvalResult LHSResult; // meaningful only for binary operator expression.
+      enum { AnyExprKind, BinOpKind, BinOpVisitedLHSKind } Kind;
+
+      Job() = default;
+      Job(Job &&) = default;
+
+      void startSpeculativeEval(EvalInfo &Info) {
+        SpecEvalRAII = SpeculativeEvaluationRAII(Info);
+      }
+
+    private:
+      SpeculativeEvaluationRAII SpecEvalRAII;
+    };
+
+    SmallVector<Job, 16> Queue;
+
+    IntExprEvaluator &IntEval;
+    EvalInfo &Info;
+    APValue &FinalResult;
+
+  public:
+    DataRecursiveIntBinOpEvaluator(IntExprEvaluator &IntEval, APValue &Result)
+        : IntEval(IntEval), Info(IntEval.getEvalInfo()), FinalResult(Result) {}
+
+    /// True if \param E is a binary operator that we are going to handle
+    /// data recursively.
+    /// We handle binary operators that are comma, logical, or that have
+    /// operands with integral or enumeration type.
+    static bool shouldEnqueue(const BinaryOperator *E) {
+      return E->getOpcode() == BO_Comma || E->isLogicalOp() ||
+             (E->isPRValue() && E->getType()->isIntegralOrEnumerationType() &&
+              E->getLHS()->getType()->isIntegralOrEnumerationType() &&
+              E->getRHS()->getType()->isIntegralOrEnumerationType());
+    }
+
+    bool Traverse(const BinaryOperator *E) {
+      enqueue(E);
+      EvalResult PrevResult;
+      while (!Queue.empty())
+        process(PrevResult);
+
+      if (PrevResult.Failed)
+        return false;
+
+      FinalResult.swap(PrevResult.Val);
+      return true;
     }
 
   private:
-    SpeculativeEvaluationRAII SpecEvalRAII;
-  };
+    bool Success(uint64_t Value, const Expr *E, APValue &Result) {
+      return IntEval.Success(Value, E, Result);
+    }
+    bool Success(const APSInt &Value, const Expr *E, APValue &Result) {
+      return IntEval.Success(Value, E, Result);
+    }
+    bool Error(const Expr *E) { return IntEval.Error(E); }
+    bool Error(const Expr *E, diag::kind D) { return IntEval.Error(E, D); }
 
-  SmallVector<Job, 16> Queue;
-
-  IntExprEvaluator &IntEval;
-  EvalInfo &Info;
-  APValue &FinalResult;
-
-public:
-  DataRecursiveIntBinOpEvaluator(IntExprEvaluator &IntEval, APValue &Result)
-    : IntEval(IntEval), Info(IntEval.getEvalInfo()), FinalResult(Result) { }
-
-  /// True if \param E is a binary operator that we are going to handle
-  /// data recursively.
-  /// We handle binary operators that are comma, logical, or that have operands
-  /// with integral or enumeration type.
-  static bool shouldEnqueue(const BinaryOperator *E) {
-    return E->getOpcode() == BO_Comma || E->isLogicalOp() ||
-           (E->isPRValue() && E->getType()->isIntegralOrEnumerationType() &&
-            E->getLHS()->getType()->isIntegralOrEnumerationType() &&
-            E->getRHS()->getType()->isIntegralOrEnumerationType());
-  }
-
-  bool Traverse(const BinaryOperator *E) {
-    enqueue(E);
-    EvalResult PrevResult;
-    while (!Queue.empty())
-      process(PrevResult);
-
-    if (PrevResult.Failed) return false;
-
-    FinalResult.swap(PrevResult.Val);
-    return true;
-  }
-
-private:
-  bool Success(uint64_t Value, const Expr *E, APValue &Result) {
-    return IntEval.Success(Value, E, Result);
-  }
-  bool Success(const APSInt &Value, const Expr *E, APValue &Result) {
-    return IntEval.Success(Value, E, Result);
-  }
-  bool Error(const Expr *E) {
-    return IntEval.Error(E);
-  }
-  bool Error(const Expr *E, diag::kind D) {
-    return IntEval.Error(E, D);
-  }
-
-  OptionalDiagnostic CCEDiag(const Expr *E, diag::kind D) {
-    return Info.CCEDiag(E, D);
-  }
-
-  // Returns true if visiting the RHS is necessary, false otherwise.
-  bool VisitBinOpLHSOnly(EvalResult &LHSResult, const BinaryOperator *E,
-                         bool &SuppressRHSDiags);
-
-  bool VisitBinOp(const EvalResult &LHSResult, const EvalResult &RHSResult,
-                  const BinaryOperator *E, APValue &Result);
-
-  void EvaluateExpr(const Expr *E, EvalResult &Result) {
-    Result.Failed = !Evaluate(Result.Val, Info, E);
-    if (Result.Failed)
-      Result.Val = APValue();
-  }
-
-  void process(EvalResult &Result);
-
-  void enqueue(const Expr *E) {
-    E = E->IgnoreParens();
-    Queue.resize(Queue.size()+1);
-    Queue.back().E = E;
-    Queue.back().Kind = Job::AnyExprKind;
-  }
-};
-
-}
-
-bool DataRecursiveIntBinOpEvaluator::
-       VisitBinOpLHSOnly(EvalResult &LHSResult, const BinaryOperator *E,
-                         bool &SuppressRHSDiags) {
-  if (E->getOpcode() == BO_Comma) {
-    // Ignore LHS but note if we could not evaluate it.
-    if (LHSResult.Failed)
-      return Info.noteSideEffect();
-    return true;
-  }
-
-  if (E->isLogicalOp()) {
-    bool LHSAsBool;
-    if (!LHSResult.Failed && HandleConversionToBool(LHSResult.Val, LHSAsBool)) {
-      // We were able to evaluate the LHS, see if we can get away with not
-      // evaluating the RHS: 0 && X -> 0, 1 || X -> 1
-      if (LHSAsBool == (E->getOpcode() == BO_LOr)) {
-        Success(LHSAsBool, E, LHSResult.Val);
-        return false; // Ignore RHS
-      }
-    } else {
-      LHSResult.Failed = true;
-
-      // Since we weren't able to evaluate the left hand side, it
-      // might have had side effects.
-      if (!Info.noteSideEffect())
-        return false;
-
-      // We can't evaluate the LHS; however, sometimes the result
-      // is determined by the RHS: X && 0 -> 0, X || 1 -> 1.
-      // Don't ignore RHS and suppress diagnostics from this arm.
-      SuppressRHSDiags = true;
+    OptionalDiagnostic CCEDiag(const Expr *E, diag::kind D) {
+      return Info.CCEDiag(E, D);
     }
 
-    return true;
+    // Returns true if visiting the RHS is necessary, false otherwise.
+    bool VisitBinOpLHSOnly(EvalResult &LHSResult, const BinaryOperator *E,
+                           bool &SuppressRHSDiags);
+
+    bool VisitBinOp(const EvalResult &LHSResult, const EvalResult &RHSResult,
+                    const BinaryOperator *E, APValue &Result);
+
+    void EvaluateExpr(const Expr *E, EvalResult &Result) {
+      Result.Failed = !Evaluate(Result.Val, Info, E);
+      if (Result.Failed)
+        Result.Val = APValue();
+    }
+
+    void process(EvalResult &Result);
+
+    void enqueue(const Expr *E) {
+      E = E->IgnoreParens();
+      Queue.resize(Queue.size() + 1);
+      Queue.back().E = E;
+      Queue.back().Kind = Job::AnyExprKind;
+    }
+  };
   }
 
-  assert(E->getLHS()->getType()->isIntegralOrEnumerationType() &&
-         E->getRHS()->getType()->isIntegralOrEnumerationType());
+  bool DataRecursiveIntBinOpEvaluator::VisitBinOpLHSOnly(
+      EvalResult & LHSResult, const BinaryOperator *E, bool &SuppressRHSDiags) {
+    if (E->getOpcode() == BO_Comma) {
+      // Ignore LHS but note if we could not evaluate it.
+      if (LHSResult.Failed)
+        return Info.noteSideEffect();
+      return true;
+    }
 
-  if (LHSResult.Failed && !Info.noteFailure())
-    return false; // Ignore RHS;
+    if (E->isLogicalOp()) {
+      bool LHSAsBool;
+      if (!LHSResult.Failed &&
+          HandleConversionToBool(LHSResult.Val, LHSAsBool)) {
+        // We were able to evaluate the LHS, see if we can get away with not
+        // evaluating the RHS: 0 && X -> 0, 1 || X -> 1
+        if (LHSAsBool == (E->getOpcode() == BO_LOr)) {
+          Success(LHSAsBool, E, LHSResult.Val);
+          return false; // Ignore RHS
+        }
+      } else {
+        LHSResult.Failed = true;
 
-  return true;
-}
+        // Since we weren't able to evaluate the left hand side, it
+        // might have had side effects.
+        if (!Info.noteSideEffect())
+          return false;
 
-static void addOrSubLValueAsInteger(APValue &LVal, const APSInt &Index,
-                                    bool IsSub) {
-  // Compute the new offset in the appropriate width, wrapping at 64 bits.
-  // FIXME: When compiling for a 32-bit target, we should use 32-bit
-  // offsets.
-  assert(!LVal.hasLValuePath() && "have designator for integer lvalue");
-  CharUnits &Offset = LVal.getLValueOffset();
-  uint64_t Offset64 = Offset.getQuantity();
-  uint64_t Index64 = Index.extOrTrunc(64).getZExtValue();
-  Offset = CharUnits::fromQuantity(IsSub ? Offset64 - Index64
-                                         : Offset64 + Index64);
-}
-
-bool DataRecursiveIntBinOpEvaluator::
-       VisitBinOp(const EvalResult &LHSResult, const EvalResult &RHSResult,
-                  const BinaryOperator *E, APValue &Result) {
-  if (E->getOpcode() == BO_Comma) {
-    if (RHSResult.Failed)
-      return false;
-    Result = RHSResult.Val;
-    return true;
-  }
-
-  if (E->isLogicalOp()) {
-    bool lhsResult, rhsResult;
-    bool LHSIsOK = HandleConversionToBool(LHSResult.Val, lhsResult);
-    bool RHSIsOK = HandleConversionToBool(RHSResult.Val, rhsResult);
-
-    if (LHSIsOK) {
-      if (RHSIsOK) {
-        if (E->getOpcode() == BO_LOr)
-          return Success(lhsResult || rhsResult, E, Result);
-        else
-          return Success(lhsResult && rhsResult, E, Result);
-      }
-    } else {
-      if (RHSIsOK) {
         // We can't evaluate the LHS; however, sometimes the result
         // is determined by the RHS: X && 0 -> 0, X || 1 -> 1.
-        if (rhsResult == (E->getOpcode() == BO_LOr))
-          return Success(rhsResult, E, Result);
+        // Don't ignore RHS and suppress diagnostics from this arm.
+        SuppressRHSDiags = true;
       }
+
+      return true;
     }
 
-    return false;
-  }
+    assert(E->getLHS()->getType()->isIntegralOrEnumerationType() &&
+           E->getRHS()->getType()->isIntegralOrEnumerationType());
 
-  assert(E->getLHS()->getType()->isIntegralOrEnumerationType() &&
-         E->getRHS()->getType()->isIntegralOrEnumerationType());
+    if (LHSResult.Failed && !Info.noteFailure())
+      return false; // Ignore RHS;
 
-  if (LHSResult.Failed || RHSResult.Failed)
-    return false;
-
-  const APValue &LHSVal = LHSResult.Val;
-  const APValue &RHSVal = RHSResult.Val;
-
-  // Handle cases like (unsigned long)&a + 4.
-  if (E->isAdditiveOp() && LHSVal.isLValue() && RHSVal.isInt()) {
-    Result = LHSVal;
-    addOrSubLValueAsInteger(Result, RHSVal.getInt(), E->getOpcode() == BO_Sub);
     return true;
   }
 
-  // Handle cases like 4 + (unsigned long)&a
-  if (E->getOpcode() == BO_Add &&
-      RHSVal.isLValue() && LHSVal.isInt()) {
-    Result = RHSVal;
-    addOrSubLValueAsInteger(Result, LHSVal.getInt(), /*IsSub*/false);
-    return true;
+  static void addOrSubLValueAsInteger(APValue & LVal, const APSInt &Index,
+                                      bool IsSub) {
+    // Compute the new offset in the appropriate width, wrapping at 64 bits.
+    // FIXME: When compiling for a 32-bit target, we should use 32-bit
+    // offsets.
+    assert(!LVal.hasLValuePath() && "have designator for integer lvalue");
+    CharUnits &Offset = LVal.getLValueOffset();
+    uint64_t Offset64 = Offset.getQuantity();
+    uint64_t Index64 = Index.extOrTrunc(64).getZExtValue();
+    Offset = CharUnits::fromQuantity(IsSub ? Offset64 - Index64
+                                           : Offset64 + Index64);
   }
 
-  if (E->getOpcode() == BO_Sub && LHSVal.isLValue() && RHSVal.isLValue()) {
-    // Handle (intptr_t)&&A - (intptr_t)&&B.
-    if (!LHSVal.getLValueOffset().isZero() ||
-        !RHSVal.getLValueOffset().isZero())
+  bool DataRecursiveIntBinOpEvaluator::VisitBinOp(
+      const EvalResult &LHSResult, const EvalResult &RHSResult,
+      const BinaryOperator *E, APValue &Result) {
+    if (E->getOpcode() == BO_Comma) {
+      if (RHSResult.Failed)
+        return false;
+      Result = RHSResult.Val;
+      return true;
+    }
+
+    if (E->isLogicalOp()) {
+      bool lhsResult, rhsResult;
+      bool LHSIsOK = HandleConversionToBool(LHSResult.Val, lhsResult);
+      bool RHSIsOK = HandleConversionToBool(RHSResult.Val, rhsResult);
+
+      if (LHSIsOK) {
+        if (RHSIsOK) {
+          if (E->getOpcode() == BO_LOr)
+            return Success(lhsResult || rhsResult, E, Result);
+          else
+            return Success(lhsResult && rhsResult, E, Result);
+        }
+      } else {
+        if (RHSIsOK) {
+          // We can't evaluate the LHS; however, sometimes the result
+          // is determined by the RHS: X && 0 -> 0, X || 1 -> 1.
+          if (rhsResult == (E->getOpcode() == BO_LOr))
+            return Success(rhsResult, E, Result);
+        }
+      }
+
       return false;
-    const Expr *LHSExpr = LHSVal.getLValueBase().dyn_cast<const Expr*>();
-    const Expr *RHSExpr = RHSVal.getLValueBase().dyn_cast<const Expr*>();
-    if (!LHSExpr || !RHSExpr)
+    }
+
+    assert(E->getLHS()->getType()->isIntegralOrEnumerationType() &&
+           E->getRHS()->getType()->isIntegralOrEnumerationType());
+
+    if (LHSResult.Failed || RHSResult.Failed)
       return false;
-    const AddrLabelExpr *LHSAddrExpr = dyn_cast<AddrLabelExpr>(LHSExpr);
-    const AddrLabelExpr *RHSAddrExpr = dyn_cast<AddrLabelExpr>(RHSExpr);
-    if (!LHSAddrExpr || !RHSAddrExpr)
+
+    const APValue &LHSVal = LHSResult.Val;
+    const APValue &RHSVal = RHSResult.Val;
+
+    // Handle cases like (unsigned long)&a + 4.
+    if (E->isAdditiveOp() && LHSVal.isLValue() && RHSVal.isInt()) {
+      Result = LHSVal;
+      addOrSubLValueAsInteger(Result, RHSVal.getInt(),
+                              E->getOpcode() == BO_Sub);
+      return true;
+    }
+
+    // Handle cases like 4 + (unsigned long)&a
+    if (E->getOpcode() == BO_Add && RHSVal.isLValue() && LHSVal.isInt()) {
+      Result = RHSVal;
+      addOrSubLValueAsInteger(Result, LHSVal.getInt(), /*IsSub*/ false);
+      return true;
+    }
+
+    if (E->getOpcode() == BO_Sub && LHSVal.isLValue() && RHSVal.isLValue()) {
+      // Handle (intptr_t)&&A - (intptr_t)&&B.
+      if (!LHSVal.getLValueOffset().isZero() ||
+          !RHSVal.getLValueOffset().isZero())
+        return false;
+      const Expr *LHSExpr = LHSVal.getLValueBase().dyn_cast<const Expr *>();
+      const Expr *RHSExpr = RHSVal.getLValueBase().dyn_cast<const Expr *>();
+      if (!LHSExpr || !RHSExpr)
+        return false;
+      const AddrLabelExpr *LHSAddrExpr = dyn_cast<AddrLabelExpr>(LHSExpr);
+      const AddrLabelExpr *RHSAddrExpr = dyn_cast<AddrLabelExpr>(RHSExpr);
+      if (!LHSAddrExpr || !RHSAddrExpr)
+        return false;
+      // Make sure both labels come from the same function.
+      if (LHSAddrExpr->getLabel()->getDeclContext() !=
+          RHSAddrExpr->getLabel()->getDeclContext())
+        return false;
+      Result = APValue(LHSAddrExpr, RHSAddrExpr);
+      return true;
+    }
+
+    // All the remaining cases expect both operands to be an integer
+    if (!LHSVal.isInt() || !RHSVal.isInt())
+      return Error(E);
+
+    // Set up the width and signedness manually, in case it can't be deduced
+    // from the operation we're performing.
+    // FIXME: Don't do this in the cases where we can deduce it.
+    APSInt Value(Info.Ctx.getIntWidth(E->getType()),
+                 E->getType()->isUnsignedIntegerOrEnumerationType());
+    if (!handleIntIntBinOp(Info, E, LHSVal.getInt(), E->getOpcode(),
+                           RHSVal.getInt(), Value))
       return false;
-    // Make sure both labels come from the same function.
-    if (LHSAddrExpr->getLabel()->getDeclContext() !=
-        RHSAddrExpr->getLabel()->getDeclContext())
-      return false;
-    Result = APValue(LHSAddrExpr, RHSAddrExpr);
-    return true;
+    return Success(Value, E, Result);
   }
 
-  // All the remaining cases expect both operands to be an integer
-  if (!LHSVal.isInt() || !RHSVal.isInt())
-    return Error(E);
+  void DataRecursiveIntBinOpEvaluator::process(EvalResult & Result) {
+    Job &job = Queue.back();
 
-  // Set up the width and signedness manually, in case it can't be deduced
-  // from the operation we're performing.
-  // FIXME: Don't do this in the cases where we can deduce it.
-  APSInt Value(Info.Ctx.getIntWidth(E->getType()),
-               E->getType()->isUnsignedIntegerOrEnumerationType());
-  if (!handleIntIntBinOp(Info, E, LHSVal.getInt(), E->getOpcode(),
-                         RHSVal.getInt(), Value))
-    return false;
-  return Success(Value, E, Result);
-}
-
-void DataRecursiveIntBinOpEvaluator::process(EvalResult &Result) {
-  Job &job = Queue.back();
-
-  switch (job.Kind) {
+    switch (job.Kind) {
     case Job::AnyExprKind: {
       if (const BinaryOperator *Bop = dyn_cast<BinaryOperator>(job.E)) {
         if (shouldEnqueue(Bop)) {

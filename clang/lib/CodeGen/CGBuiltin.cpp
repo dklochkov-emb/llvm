@@ -2371,7 +2371,7 @@ static RValue EmitHipStdParUnsupportedBuiltin(CodeGenFunction *CGF,
   return RValue::get(CGF->Builder.CreateCall(UBF, Args));
 }
 
-static RValue EmitSYCLFreeFunctionKernelBuiltin(CodeGenFunction &CGF,
+static constexpr RValue EmitSYCLFreeFunctionKernelBuiltin(CodeGenFunction &CGF,
                                                 const CallExpr *E,
                                                 StringRef NameStr1,
                                                 StringRef NameStr2,
@@ -2389,17 +2389,22 @@ static RValue EmitSYCLFreeFunctionKernelBuiltin(CodeGenFunction &CGF,
     const FunctionDecl *FD = dyn_cast<FunctionDecl>(DRE->getDecl());
     if (FD && FD->hasAttr<SYCLAddIRAttributesFunctionAttr>()) {
       auto *SAIRAttr = FD->getAttr<SYCLAddIRAttributesFunctionAttr>();
-      SmallVector<std::pair<std::string, std::string>, 4> NameValuePairs =
-          SAIRAttr->getFilteredAttributeNameValuePairs(CGF.CGM.getContext());
-      for (const auto &NVPair : NameValuePairs) {
-        if (!NVPair.first.compare(NameStr1) ||
-            (!NameStr2.empty() && !!NVPair.first.compare(NameStr2))) {
+      llvm::StringRef strValCmp;
+      int intVal = 0;
+      for (const Expr *E : SAIRAttr->args()) {
+        if (const clang::StringLiteral *SL = dyn_cast<clang::StringLiteral>(E->IgnoreParenImpCasts())) {
+          strValCmp = SL->getString();
+        } else if (const IntegerLiteral *IL = dyn_cast<IntegerLiteral>(E->IgnoreParenImpCasts())) {
+          intVal = static_cast<int>(IL->getValue().getSExtValue());
+        }
+      }
+        if (strValCmp == NameStr1 || strValCmp == NameStr2) {
           if (CheckNDRangeDim) {
             uint64_t Dim = E->getArg(1)
                                ->EvaluateKnownConstInt(CGF.CGM.getContext())
                                .getZExtValue();
             // Return true only if the dimensions match.
-            if (std::stoul(NVPair.second) == Dim)
+            if (intVal == Dim)
               return RValue::get(
                   llvm::ConstantInt::getTrue(CGF.ConvertType(E->getType())));
             else
@@ -2410,7 +2415,6 @@ static RValue EmitSYCLFreeFunctionKernelBuiltin(CodeGenFunction &CGF,
           return RValue::get(
               llvm::ConstantInt::getTrue(CGF.ConvertType(E->getType())));
         }
-      }
     }
   }
   // Return false otherwise.

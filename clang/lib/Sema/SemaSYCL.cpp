@@ -6929,9 +6929,9 @@ void SYCLIntegrationHeader::emit(raw_ostream &O) {
     return;
   }
 
-  unsigned ShimCounter = 1;
-  int FreeFunctionCount = 0;
-  for (const KernelDesc &K : KernelDescs) {
+  //unsigned ShimCounter = 1;
+  //int FreeFunctionCount = 0;
+  /*for (const KernelDesc &K : KernelDescs) {
     if (!S.isFreeFunction(K.SyclKernel))
       continue;
     ++FreeFunctionCount;
@@ -7039,9 +7039,9 @@ void SYCLIntegrationHeader::emit(raw_ostream &O) {
     O << "};\n";
     O << "}\n";
     ++ShimCounter;
-  }
+  }*/
 
-  if (FreeFunctionCount > 0) {
+ /* if (FreeFunctionCount > 0) {
     O << "\n#include <sycl/kernel_bundle.hpp>\n";
   }
   ShimCounter = 1;
@@ -7059,7 +7059,7 @@ void SYCLIntegrationHeader::emit(raw_ostream &O) {
     O << "}\n";
     O << "}\n";
     ++ShimCounter;
-  }
+  }*/
 }
 
 bool SYCLIntegrationHeader::emit(StringRef IntHeaderName) {

@@ -38,6 +38,13 @@ __attribute__((sycl_device))
 void sndrk_free_func() {
 }
 
+class AAA {
+  public:
+[[__sycl_detail__::add_ir_attributes_function("sycl-nd-range-kernel", 4)]]
+static void sndrk_free_func(int *ptr, int val) {
+}
+};
+
 void func() {}
 
 void foo() {
@@ -69,6 +76,8 @@ void foo() {
   // CHECK: store i8 1, ptr addrspace(4) %b10{{.*}}, align 1
   constexpr bool b11 = __builtin_sycl_is_kernel((void(*)(int *, int))ovl_free_func);  // Okay
   // CHECK: store i8 1, ptr addrspace(4) %b11{{.*}}, align 1
+  constexpr bool b12 = __builtin_sycl_is_kernel((void(*)(int *))AAA::sndrk_free_func);  // Okay
+  static_assert(b12, "b12 should be true");
 }
 
 void f() {

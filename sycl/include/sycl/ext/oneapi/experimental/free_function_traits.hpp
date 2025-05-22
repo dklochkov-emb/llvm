@@ -34,11 +34,12 @@ template <auto *Func> struct is_kernel {
 // figure out during this phase. Therefore, we set the is_kernel trait to true
 // by default during device compilation in order to not get missing functions
 // errors.
-#ifdef __SYCL_DEVICE_ONLY__
+/*#ifdef __SYCL_DEVICE_ONLY__
   static constexpr bool value = true;
 #else
   static constexpr bool value = false;
-#endif
+#endif*/
+static constexpr bool value = __builtin_sycl_is_kernel(Func);
 };
 
 template <auto *Func>

@@ -12960,39 +12960,62 @@ isSYCLFreeFunctionKernel(IntExprEvaluator &IEV, const EvalInfo &Info,
                          StringRef NameStr2,
                          bool CheckNDRangeKernelDim = false) {
   const Expr *ArgExpr = E->getArg(0)->IgnoreParenImpCasts();
-  while (isa<CastExpr>(ArgExpr))
-    ArgExpr = cast<CastExpr>(ArgExpr)->getSubExpr();
+  if (isa<clang::CastExpr>(ArgExpr))
+    ArgExpr = cast<clang::CastExpr>(ArgExpr)->getSubExpr();
+  else if (isa<clang::UnaryOperator>(ArgExpr)) {
+    const auto *UO = cast<clang::UnaryOperator>(ArgExpr);
+    if (UO->getOpcode() == clang::UO_AddrOf)
+      ArgExpr = UO->getSubExpr()->IgnoreParenImpCasts();
+  }
+
   auto *DRE = dyn_cast<DeclRefExpr>(ArgExpr);
   if (DRE) {
     const FunctionDecl *FD = dyn_cast<FunctionDecl>(DRE->getDecl());
     if (FD) {
       auto *SAIRAttr = FD->getAttr<SYCLAddIRAttributesFunctionAttr>();
+      if (!SAIRAttr) {
+        if (const auto *FTSI = FD->getTemplateSpecializationInfo()) {
+          const FunctionDecl *Pattern = FTSI->getTemplate()->getTemplatedDecl();
+          for (const auto *Redecl : Pattern->redecls()) {
+            SAIRAttr = Redecl->getAttr<SYCLAddIRAttributesFunctionAttr>();
+            if (SAIRAttr)
+              break;
+          }
+        }
+      }
       if (!SAIRAttr)
         return IEV.Success(false, E);
 
-      llvm::StringRef strValCmp;
+      StringRef strValCmp;
       int intVal = 0;
-      for (const Expr *E : SAIRAttr->args()) {
-        if (const StringLiteral *SL =
-                dyn_cast<StringLiteral>(E->IgnoreParenImpCasts())) {
+      for (const Expr *Arg : SAIRAttr->args()) {
+        Arg = Arg->IgnoreParenImpCasts();
+        if (const StringLiteral *SL = dyn_cast<StringLiteral>(Arg))
           strValCmp = SL->getString();
-        } else if (const IntegerLiteral *IL =
-                       dyn_cast<IntegerLiteral>(E->IgnoreParenImpCasts())) {
+        else if (const IntegerLiteral *IL = dyn_cast<IntegerLiteral>(Arg))
           intVal = static_cast<int>(IL->getValue().getSExtValue());
+        else if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(Arg)) {
+          if (const VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+            if (VD->hasInit()) {
+              const Expr *Init = VD->getInit()->IgnoreParenImpCasts();
+              if (const StringLiteral *SL = dyn_cast<StringLiteral>(Init))
+                strValCmp = SL->getString();
+              else if (const IntegerLiteral *IL =
+                           dyn_cast<IntegerLiteral>(Init)) {
+                intVal = static_cast<int>(IL->getValue().getSExtValue());
+              }
+            }
+          }
         }
       }
       if (strValCmp == NameStr1 || strValCmp == NameStr2) {
         if (CheckNDRangeKernelDim) {
           uint64_t Dim =
               E->getArg(1)->EvaluateKnownConstInt(Info.Ctx).getZExtValue();
-          // Return true only if the dimensions match.
           if (intVal == Dim)
             return IEV.Success(true, E);
-          else
-            return IEV.Success(false, E);
+          return IEV.Success(false, E);
         }
-        // Return true if it has the sycl-single-task-kernel or the
-        // sycl-nd-range-kernel attribute.
         return IEV.Success(true, E);
       }
       return IEV.Success(false, E);
@@ -14049,7 +14072,7 @@ isSYCLFreeFunctionKernel(IntExprEvaluator &IEV, const EvalInfo &Info,
     case Builtin::BI__builtin_sycl_is_nd_range_kernel: {
       return isSYCLFreeFunctionKernel(*this, Info, E, "sycl-nd-range-kernel",
                                       "",
-                                      /*CheckNDRangeDim=*/true);
+                                      true);
     }
     }
   }

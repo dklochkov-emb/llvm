@@ -16,6 +16,7 @@
 #include <sycl/queue.hpp>
 
 #include <vector>
+#include <type_traits>
 
 namespace sycl {
 inline namespace _V1 {
@@ -69,13 +70,30 @@ get_kernel_info(const context &ctxt) {
 
 template <auto *Func, typename Param>
 std::enable_if_t<ext::oneapi::experimental::is_kernel_v<Func>,
-                 typename sycl::detail::is_kernel_device_specific_info_desc<
-                     Param>::return_type>
+         typename sycl::detail::is_kernel_device_specific_info_desc<
+           Param>::return_type>
 get_kernel_info(const context &ctxt, const device &dev) {
   auto Bundle = sycl::ext::oneapi::experimental::get_kernel_bundle<
-      Func, sycl::bundle_state::executable>(ctxt);
+    Func, sycl::bundle_state::executable>(ctxt);
   return Bundle.template ext_oneapi_get_kernel<Func>().template get_info<Param>(
-      dev);
+    dev);
+}
+
+
+template <auto *Func, typename Param>
+std::enable_if_t<ext::oneapi::experimental::is_kernel_v<Func>, size_t>
+get_kernel_info(const context &ctxt, const device &dev) {
+  if constexpr (std::is_same_v<Param, sycl::info::kernel::num_args>) {
+    auto Bundle = sycl::ext::oneapi::experimental::get_kernel_bundle<
+        Func, sycl::bundle_state::executable>(ctxt);
+    auto kernel_id = sycl::ext::oneapi::experimental::get_kernel_id<Func>();;
+    sycl::kernel kernel = Bundle.get_kernel(kernel_id);
+    return Bundle.template ext_oneapi_get_kernel<Func>()
+        .template get_info<Param>();
+  }
+  sycl::exception(
+      sycl::make_error_code(sycl::errc::invalid),
+      "get_kernel_info is not supported for free function kernels.");
 }
 
 template <auto *Func, typename Param>

@@ -12,6 +12,8 @@
 
 #include <memory>
 
+#include <iostream>
+
 namespace sycl {
 inline namespace _V1 {
 namespace detail {
@@ -104,13 +106,29 @@ std::string_view kernel_impl::getName() const {
 }
 
 bool kernel_impl::isBuiltInKernel(const device &Device) const {
+  std::cout << "isBuiltInKernel" << std::endl;
   auto BuiltInKernels = Device.get_info<info::device::built_in_kernel_ids>();
+  std::cout << "Built-in kernels available on the device:" << std::endl;
+  for (const auto &kernel_id : BuiltInKernels) {
+    std::cout << "  " << kernel_id.get_name() << std::endl;
+  }
   if (BuiltInKernels.empty())
     return false;
   std::string KernelName = get_info<info::kernel::function_name>();
   return (std::any_of(
       BuiltInKernels.begin(), BuiltInKernels.end(),
       [&KernelName](kernel_id &Id) { return Id.get_name() == KernelName; }));
+}
+
+bool kernel_impl::isFreeFunctionKernel() const {
+  const auto ids = MKernelBundleImpl->get_kernel_ids();
+  return std::any_of(
+      ids.begin(), ids.end(),
+      [this](const kernel_id &Id) {
+        const std::string KernelName = Id.get_name();
+        const auto pos = KernelName.find("__sycl_kernel_");
+        return pos != std::string::npos;
+      });
 }
 
 void kernel_impl::checkIfValidForNumArgsInfoQuery() const {
@@ -120,6 +138,10 @@ void kernel_impl::checkIfValidForNumArgsInfoQuery() const {
   if (std::any_of(Devices.begin(), Devices.end(),
                   [this](device &Device) { return isBuiltInKernel(Device); }))
     return;
+
+  if (isFreeFunctionKernel())
+    return;
+  std::cout << "checkIfValidForNumArgsInfoQuery has not finded" << std::endl;
 
   throw sycl::exception(
       sycl::make_error_code(errc::invalid),

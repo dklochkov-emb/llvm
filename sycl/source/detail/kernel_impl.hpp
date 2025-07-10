@@ -256,6 +256,7 @@ private:
   mutable std::string MName;
 
   bool isBuiltInKernel(const device &Device) const;
+  bool isFreeFunctionKernel() const;
   void checkIfValidForNumArgsInfoQuery() const;
 
   /// Check if the occupancy limits are exceeded for the given kernel launch

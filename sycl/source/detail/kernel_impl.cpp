@@ -12,8 +12,6 @@
 
 #include <memory>
 
-#include <iostream>
-
 namespace sycl {
 inline namespace _V1 {
 namespace detail {
@@ -106,12 +104,7 @@ std::string_view kernel_impl::getName() const {
 }
 
 bool kernel_impl::isBuiltInKernel(const device &Device) const {
-  std::cout << "isBuiltInKernel" << std::endl;
   auto BuiltInKernels = Device.get_info<info::device::built_in_kernel_ids>();
-  std::cout << "Built-in kernels available on the device:" << std::endl;
-  for (const auto &kernel_id : BuiltInKernels) {
-    std::cout << "  " << kernel_id.get_name() << std::endl;
-  }
   if (BuiltInKernels.empty())
     return false;
   std::string KernelName = get_info<info::kernel::function_name>();

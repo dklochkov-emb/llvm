@@ -134,7 +134,6 @@ void kernel_impl::checkIfValidForNumArgsInfoQuery() const {
 
   if (isFreeFunctionKernel())
     return;
-  std::cout << "checkIfValidForNumArgsInfoQuery has not finded" << std::endl;
 
   throw sycl::exception(
       sycl::make_error_code(errc::invalid),

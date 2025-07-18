@@ -40,9 +40,10 @@ static void call_kernel_code(sycl::queue &q, sycl::kernel &kernel) {
 }
 
 template <auto *Func>
-int test_num_args(sycl::context &ctxt, const int expected_num_args) {
+int test_num_args_free_function_api(sycl::context &ctxt, sycl::device &dev,
+                                    const int expected_num_args) {
   const int actual =
-      syclexp::get_kernel_info<Func, sycl::info::kernel::num_args>(ctxt);
+      syclexp::get_kernel_info<Func, sycl::info::kernel::num_args>(ctxt, dev);
   const bool res = actual == expected_num_args;
   if (!res)
     std::cout << FFTestMark << "test_num_args failed: expected_num_args "
@@ -50,20 +51,59 @@ int test_num_args(sycl::context &ctxt, const int expected_num_args) {
   return res;
 }
 
+template <auto *Func>
+int test_num_args_kernel_api(sycl::context &ctxt, sycl::device &dev,
+                             const int expected_num_args) {
+  auto bundle =
+      syclexp::get_kernel_bundle<Func, sycl::bundle_state::executable>(ctxt);
+  const int actual = bundle.template ext_oneapi_get_kernel<Func>()
+                         .template get_info<sycl::info::kernel::num_args>();
+  std::cout << FFTestMark << "actual number of args: " << actual
+            << " expected: " << expected_num_args << std::endl;
+  const bool res = actual == expected_num_args;
+  if (!res)
+    std::cout << FFTestMark << "test_num_args_kernel_api failed: expected_num_args "
+              << expected_num_args << "actual " << actual << std::endl;
+  return res;
+}
+
+static bool call_kernel_code(sycl::queue &q, sycl::kernel &kernel) {
+  int *ptr = sycl::malloc_shared<int>(NUM, q);
+  q.submit([&](sycl::handler &cgh) {
+     cgh.set_args(3, ptr);
+     sycl::nd_range ndr{{NUM}, {WGSIZE}};
+     cgh.parallel_for(ndr, kernel);
+   }).wait();
+  sycl::free(ptr, q);
+  return true;
+}
+
 int main() {
-    sycl::queue q;
-    sycl::context ctx = q.get_context();
-    sycl::device dev = q.get_device();
+  sycl::queue q;
+  sycl::context ctx = q.get_context();
+  sycl::device dev = q.get_device();
 
-    auto bundle_range =
-        syclexp::get_kernel_bundle<func_single, sycl::bundle_state::executable>(
-            ctx);
+  /*auto bndl_r =
+      syclexp::get_kernel_bundle<func_range, sycl::bundle_state::executable>(
+          ctx);
+  auto bndl_s =
+      syclexp::get_kernel_bundle<func_single, sycl::bundle_state::executable>(
+          ctx);*/
+  auto bndl_k =
+      syclexp::get_kernel_bundle<func_range, sycl::bundle_state::executable>(
+          ctx);
+  //sycl::kernel k_func_range = bndl_r.ext_oneapi_get_kernel<func_range>();
+  //sycl::kernel k_func_single = bndl_s.ext_oneapi_get_kernel<func_single>();
+  sycl::kernel k_kernel_func = bndl_k.ext_oneapi_get_kernel<kernel_func>();
+  //call_kernel_code(q, k_func_range);
+ // call_kernel_code(q, k_func_single);
+  call_kernel_code(q, k_kernel_func);
 
-    auto actual =
-        syclexp::get_kernel_info<func_single, sycl::info::kernel::num_args>(
-            ctx, dev);
-
-  std::cout << "Actual number of arguments: " << actual << std::endl;
-    assert(actual == 2 && "kernel should take 2 args");
-    return 0;
+  int ret = test_num_args_free_function_api<func_range>(ctx, dev, 2);
+  ret |= test_num_args_free_function_api<func_single>(ctx, dev, 2);
+  ret |= test_num_args_free_function_api<kernel_func>(ctx, dev, 3);
+  ret |= test_num_args_kernel_api<func_range>(ctx, dev, 2);
+  ret |= test_num_args_kernel_api<func_single>(ctx, dev, 2);
+  ret |= test_num_args_kernel_api<kernel_func>(ctx, dev, 3);
+  return ret;
 }

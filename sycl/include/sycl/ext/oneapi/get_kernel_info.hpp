@@ -79,23 +79,6 @@ get_kernel_info(const context &ctxt, const device &dev) {
     dev);
 }
 
-
-template <auto *Func, typename Param>
-std::enable_if_t<ext::oneapi::experimental::is_kernel_v<Func>, size_t>
-get_kernel_info(const context &ctxt, const device &dev) {
-  if constexpr (std::is_same_v<Param, sycl::info::kernel::num_args>) {
-    auto Bundle = sycl::ext::oneapi::experimental::get_kernel_bundle<
-        Func, sycl::bundle_state::executable>(ctxt);
-    auto kernel_id = sycl::ext::oneapi::experimental::get_kernel_id<Func>();;
-    sycl::kernel kernel = Bundle.get_kernel(kernel_id);
-    return Bundle.template ext_oneapi_get_kernel<Func>()
-        .template get_info<Param>();
-  }
-  sycl::exception(
-      sycl::make_error_code(sycl::errc::invalid),
-      "get_kernel_info is not supported for free function kernels.");
-}
-
 template <auto *Func, typename Param>
 std::enable_if_t<ext::oneapi::experimental::is_kernel_v<Func>,
                  typename sycl::detail::is_kernel_device_specific_info_desc<
@@ -103,6 +86,19 @@ std::enable_if_t<ext::oneapi::experimental::is_kernel_v<Func>,
 get_kernel_info(const queue &q) {
   return get_kernel_info<Func, Param>(q.get_context(), q.get_device());
 }
+
+template <auto *Func, typename Param>
+std::enable_if_t<ext::oneapi::experimental::is_kernel_v<Func>, size_t>
+get_kernel_info(const context &ctxt, const device &dev) {
+  if constexpr (std::is_same_v<Param, sycl::info::kernel::num_args>) {
+    std::cout << "getting number of params for free function kernel\n";
+    return sycl::detail::FreeFunctionInfoData<Func>::getNumParams();
+  }
+  sycl::exception(
+      sycl::make_error_code(sycl::errc::invalid),
+      "get_kernel_info is not supported for free function kernels.");
+}
+
 } // namespace experimental
 } // namespace ext::oneapi
 } // namespace _V1

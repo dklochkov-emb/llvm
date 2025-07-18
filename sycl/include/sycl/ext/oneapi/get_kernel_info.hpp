@@ -89,7 +89,7 @@ get_kernel_info(const queue &q) {
 
 template <auto *Func, typename Param>
 std::enable_if_t<ext::oneapi::experimental::is_kernel_v<Func>, size_t>
-get_kernel_info(const context &ctxt, const device &dev) {
+get_kernel_info(const context &, const device &) {
   if constexpr (std::is_same_v<Param, sycl::info::kernel::num_args>) {
     std::cout << "getting number of params for free function kernel\n";
     return sycl::detail::FreeFunctionInfoData<Func>::getNumParams();

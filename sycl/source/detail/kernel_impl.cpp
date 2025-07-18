@@ -124,6 +124,10 @@ bool kernel_impl::isFreeFunctionKernel() const {
       });
 }
 
+void kernel_impl::setKerenlFreeFuncArgNum(unsigned Num) {
+  FreeFuncKernelArgNum = Num;
+}
+
 void kernel_impl::checkIfValidForNumArgsInfoQuery() const {
   if (isInteropOrSourceBased())
     return;

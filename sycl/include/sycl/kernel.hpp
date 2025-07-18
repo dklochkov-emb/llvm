@@ -125,14 +125,11 @@ public:
   /// \return depends on information being queried.
   template <typename Param>
   typename detail::is_kernel_info_desc<Param>::return_type get_info() const {
-    if constexpr (std::is_same_v<Param, sycl::info::kernel::num_args>)
-      return FreeFuncKernelArgNum;
     return detail::convert_from_abi_neutral(get_info_impl<Param>());
   }
 
-  void setFreeFuncKernelArgNum(const unsigned Num) {
-    FreeFuncKernelArgNum = Num;
-  }
+  void setFreeFuncKernelArgNum(unsigned Num);
+
   /// Queries the kernel object for SYCL backend-specific information.
   ///
   /// The return type depends on information being queried.
@@ -254,6 +251,10 @@ public:
   typename detail::is_kernel_queue_specific_info_desc<Param>::return_type
   ext_oneapi_get_info(queue Queue, const range<1> &WG) const;
 
+  /// Set kernel free function argument number.
+  /// \param Num is the number of arguments of the free function kernel.
+  void setKerenlFreeFuncArgNum(unsigned Num);
+
 private:
   /// Constructs a SYCL kernel object from a valid kernel_impl instance.
   kernel(std::shared_ptr<detail::kernel_impl> Impl);
@@ -264,7 +265,6 @@ private:
   ur_native_handle_t getNativeImpl() const;
 
   std::shared_ptr<detail::kernel_impl> impl;
-  unsigned FreeFuncKernelArgNum = 0;
 
   template <class Obj>
   friend const decltype(Obj::impl) &

@@ -6694,10 +6694,10 @@ public:
   void printFreeFunctionKernelInfo(const unsigned ShimCounter,
                                    const size_t KParamsSize,
                                    std::string_view KName) {
-    O << "namespace sycl {\n";
+    O << "\nnamespace sycl {\n";
     O << "inline namespace _V1 {\n";
     O << "namespace detail {\n";
-    O << "//Free Funct5ion Kernel info specialization for shim" << ShimCounter
+    O << "//Free Function Kernel info specialization for shim" << ShimCounter
       << "\n";
     O << "template <> struct FreeFunctionInfoData<__sycl_shim" << ShimCounter
       << "()> {\n";
@@ -6710,7 +6710,7 @@ public:
     O << "};\n";
     O << "} // namespace detail\n"
       << "} // namespace _V1\n"
-      << "} // namespace sycl\n";
+      << "} // namespace sycl\n\n";
   }
 
 private:

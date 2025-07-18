@@ -241,6 +241,7 @@ public:
   const KernelArgMask *getKernelArgMask() const { return MKernelArgMaskPtr; }
   std::mutex *getCacheMutex() const { return MCacheMutex; }
   std::string_view getName() const;
+  void setKerenlFreeFuncArgNum(unsigned Num);
 
 private:
   ur_kernel_handle_t MKernel = nullptr;
@@ -254,6 +255,7 @@ private:
   const KernelArgMask *MKernelArgMaskPtr;
   std::mutex *MCacheMutex = nullptr;
   mutable std::string MName;
+  unsigned FreeFuncKernelArgNum = 0;
 
   bool isBuiltInKernel(const device &Device) const;
   bool isFreeFunctionKernel() const;
@@ -310,9 +312,10 @@ template <typename Param>
 inline typename Param::return_type kernel_impl::get_info() const {
   static_assert(is_kernel_info_desc<Param>::value,
                 "Invalid kernel information descriptor");
-  if constexpr (std::is_same_v<Param, info::kernel::num_args>)
+  if constexpr (std::is_same_v<Param, info::kernel::num_args>) {
     checkIfValidForNumArgsInfoQuery();
-
+    return FreeFuncKernelArgNum;
+  }
   return get_kernel_info<Param>(this->getHandleRef(), getAdapter());
 }
 

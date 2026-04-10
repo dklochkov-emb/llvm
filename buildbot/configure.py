@@ -5,7 +5,6 @@ import shlex
 import subprocess
 import sys
 
-"TEst change"
 
 def do_configure(args, passthrough_args):
     # Get absolute path to source directory

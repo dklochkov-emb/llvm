@@ -53,7 +53,13 @@ enum ur_ze_external_memory_desc_type {
 struct ur_ze_external_memory_data {
   void *importExtensionDesc;
   enum ur_ze_external_memory_desc_type type;
+  ur_exp_external_mem_type_t handleType;
   size_t size;
+};
+
+struct ur_ze_image_handle_entry_t {
+  ze_image_handle_t handle;
+  bool ownsHandle;
 };
 
 struct ur_device_handle_t_ : ur_object {
@@ -264,7 +270,7 @@ struct ur_device_handle_t_ : ur_object {
   ZeCache<ZexStruct<ze_intel_xe_device_exp_properties_t>> ZeXEDeviceProperties;
 
   // Map device bindless image offset to corresponding host image handle.
-  std::unordered_map<ur_exp_image_native_handle_t, ze_image_handle_t>
+  std::unordered_map<ur_exp_image_native_handle_t, ur_ze_image_handle_entry_t>
       ZeOffsetToImageHandleMap;
 
   // Devices which user enabled p2p access by

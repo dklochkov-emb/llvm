@@ -311,27 +311,6 @@ ur_result_t bindlessImagesCreateImpl(ur_context_handle_t hContext,
     ZeImageDesc.flags |= ZE_IMAGE_FLAG_KERNEL_WRITE;
   }
 
-  if (pImageDesc->type == UR_MEM_TYPE_IMAGE2D ||
-      pImageDesc->type == UR_MEM_TYPE_IMAGE3D) {
-    fprintf(stderr,
-            "[DBG] bindlessImagesCreateImpl: "
-            "type=%u w=%zu h=%zu depth=%zu miplevels=%u Sampled=%d "
-            "ZeImageDesc.flags=0x%x ZeImageDesc.type=%u "
-            "ZeBindlessDesc.flags=0x%x "
-            "format(channelType=%u channelOrder=%u)\n",
-            (unsigned)pImageDesc->type,
-            (size_t)pImageDesc->width, (size_t)pImageDesc->height,
-            (size_t)pImageDesc->depth,
-            ZeImageDesc.miplevels,
-            (int)Sampled,
-            (unsigned)ZeImageDesc.flags,
-            (unsigned)ZeImageDesc.type,
-            (unsigned)BindlessDesc.flags,
-            (unsigned)pImageFormat->channelType,
-            (unsigned)pImageFormat->channelOrder);
-    fflush(stderr);
-  }
-
   v2::raii::ze_image_handle_t ZeImage;
 
   ze_memory_allocation_properties_t MemAllocProperties{
@@ -347,15 +326,6 @@ ur_result_t bindlessImagesCreateImpl(ur_context_handle_t hContext,
     ur_bindless_mem_handle_t *urImg =
         reinterpret_cast<ur_bindless_mem_handle_t *>(hImageMem);
     ze_image_handle_t zeImg1 = urImg->getZeImage();
-
-    if (pImageDesc->type == UR_MEM_TYPE_IMAGE2D ||
-        pImageDesc->type == UR_MEM_TYPE_IMAGE3D) {
-      fprintf(stderr,
-              "[DBG] bindlessImagesCreateImpl: path=UNKNOWN (zeImageViewCreateExt)"
-              " zeImg1=%p hImageMem=%p\n",
-              (void *)zeImg1, (void *)hImageMem);
-      fflush(stderr);
-    }
 
     try {
       ZE2UR_CALL_THROWS(
@@ -399,16 +369,6 @@ ur_result_t bindlessImagesCreateImpl(ur_context_handle_t hContext,
       hDevice->Platform->ZeImageGetDeviceOffsetExt.zeImageGetDeviceOffsetExp,
       (ZeImageTranslated, &DeviceOffset));
   *phImage = DeviceOffset;
-
-  if (pImageDesc->type == UR_MEM_TYPE_IMAGE2D ||
-      pImageDesc->type == UR_MEM_TYPE_IMAGE3D) {
-    fprintf(stderr,
-            "[DBG] bindlessImagesCreateImpl: DeviceOffset=0x%llx"
-            " phImage=0x%llx\n",
-            (unsigned long long)DeviceOffset,
-            (unsigned long long)(uint64_t)*phImage);
-    fflush(stderr);
-  }
 
   std::shared_lock<ur_shared_mutex> Lock(hDevice->Mutex);
   hDevice->ZeOffsetToImageHandleMap[*phImage] = ZeImage.get();
@@ -1405,26 +1365,6 @@ ur_result_t urBindlessImagesMapExternalArrayExp(
   ZeImageBindlessDesc.flags = ZE_IMAGE_BINDLESS_EXP_FLAG_BINDLESS;
   ZeImageDesc.flags = ZE_IMAGE_FLAG_KERNEL_WRITE;
   ZeImageDesc.pNext = &ZeImageBindlessDesc;
-
-  if (pImageDesc->type == UR_MEM_TYPE_IMAGE2D ||
-      pImageDesc->type == UR_MEM_TYPE_IMAGE3D) {
-    fprintf(stderr,
-            "[DBG] urBindlessImagesMapExternalArrayExp: "
-            "type=%u w=%zu h=%zu depth=%zu miplevels=%u "
-            "ZeImageDesc.flags=0x%x ZeImageDesc.type=%u "
-            "ZeBindlessDesc.flags=0x%x "
-            "format(channelType=%u channelOrder=%u)\n",
-            (unsigned)pImageDesc->type,
-            (size_t)pImageDesc->width, (size_t)pImageDesc->height,
-            (size_t)pImageDesc->depth,
-            ZeImageDesc.miplevels,
-            (unsigned)ZeImageDesc.flags,
-            (unsigned)ZeImageDesc.type,
-            (unsigned)ZeImageBindlessDesc.flags,
-            (unsigned)pImageFormat->channelType,
-            (unsigned)pImageFormat->channelOrder);
-    fflush(stderr);
-  }
 
   UR_CALL(createUrImgFromZeImage(hContext->getZeHandle(), hDevice->ZeDevice,
                                  ZeImageDesc, phImageMem));

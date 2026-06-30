@@ -17,11 +17,9 @@
 
 struct ur_bindless_mem_handle_t {
   // Constructor for bindless image handle
-  ur_bindless_mem_handle_t(
-      ze_image_handle_t zeImage, const ZeStruct<ze_image_desc_t> &zeImageDesc,
-      bool useNativeImageForUnsampledHandle = false)
-      : zeImage(zeImage),
-        useNativeImageForUnsampledHandle(useNativeImageForUnsampledHandle) {
+  ur_bindless_mem_handle_t(ze_image_handle_t zeImage,
+                           const ZeStruct<ze_image_desc_t> &zeImageDesc)
+      : zeImage(zeImage) {
 
     format = zeImageDesc.format;
     width = zeImageDesc.width;
@@ -30,9 +28,6 @@ struct ur_bindless_mem_handle_t {
   };
 
   ze_image_handle_t getZeImage() const { return zeImage.get(); }
-  bool shouldUseNativeImageForUnsampledHandle() const {
-    return useNativeImageForUnsampledHandle;
-  }
 
   ze_image_format_t getFormat() const { return format; }
   uint64_t getWidth() const { return width; }
@@ -41,7 +36,6 @@ struct ur_bindless_mem_handle_t {
 
 private:
   v2::raii::ze_image_handle_t zeImage;
-  bool useNativeImageForUnsampledHandle;
   ze_image_format_t format;
   uint64_t width;
   uint64_t height;

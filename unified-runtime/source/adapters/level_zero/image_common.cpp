@@ -259,9 +259,7 @@ ur_result_t ze2urImageFormat(const ze_image_format_t &ZeImageFormat,
 ur_result_t createUrImgFromZeImage(ze_context_handle_t hContext,
                                    ze_device_handle_t hDevice,
                                    const ZeStruct<ze_image_desc_t> &ZeImageDesc,
-                                   ur_exp_image_mem_native_handle_t *pImg,
-                                   bool useNativeImageForUnsampledHandle =
-                                       false) {
+                                   ur_exp_image_mem_native_handle_t *pImg) {
   v2::raii::ze_image_handle_t ZeImage;
   try {
     ZE2UR_CALL_THROWS(zeImageCreate,
@@ -274,8 +272,7 @@ ur_result_t createUrImgFromZeImage(ze_context_handle_t hContext,
 
   try {
     ur_bindless_mem_handle_t *urImg =
-        new ur_bindless_mem_handle_t(ZeImage.get(), ZeImageDesc,
-                                     useNativeImageForUnsampledHandle);
+        new ur_bindless_mem_handle_t(ZeImage.get(), ZeImageDesc);
     ZeImage.release();
     *pImg = reinterpret_cast<ur_exp_image_mem_native_handle_t>(urImg);
   } catch (...) {
@@ -336,8 +333,6 @@ ur_result_t bindlessImagesCreateImpl(ur_context_handle_t hContext,
   }
 
   v2::raii::ze_image_handle_t ZeImage;
-  ze_image_handle_t ImageForOffset = nullptr;
-  bool OwnsImageForOffset = true;
 
   ze_memory_allocation_properties_t MemAllocProperties{
       ZE_STRUCTURE_TYPE_MEMORY_ALLOCATION_PROPERTIES, nullptr,
@@ -353,36 +348,23 @@ ur_result_t bindlessImagesCreateImpl(ur_context_handle_t hContext,
         reinterpret_cast<ur_bindless_mem_handle_t *>(hImageMem);
     ze_image_handle_t zeImg1 = urImg->getZeImage();
 
-    if (!Sampled && urImg->shouldUseNativeImageForUnsampledHandle()) {
-      if (pImageDesc->type == UR_MEM_TYPE_IMAGE2D ||
-          pImageDesc->type == UR_MEM_TYPE_IMAGE3D) {
-        fprintf(stderr,
-                "[DBG] bindlessImagesCreateImpl: path=native zeImg=%p "
-                "hImageMem=%p\n",
-                (void *)zeImg1, (void *)hImageMem);
-        fflush(stderr);
-      }
-      ImageForOffset = zeImg1;
-      OwnsImageForOffset = false;
-    } else {
-      if (pImageDesc->type == UR_MEM_TYPE_IMAGE2D ||
-          pImageDesc->type == UR_MEM_TYPE_IMAGE3D) {
-        fprintf(stderr,
-                "[DBG] bindlessImagesCreateImpl: path=zeImageViewCreateExt "
-                "zeImg=%p hImageMem=%p\n",
-                (void *)zeImg1, (void *)hImageMem);
-        fflush(stderr);
-      }
-      try {
-        ZE2UR_CALL_THROWS(
-            zeImageViewCreateExt,
-            (zeCtx, hDevice->ZeDevice, &ZeImageDesc, zeImg1, ZeImage.ptr()));
-        ZE2UR_CALL_THROWS(zeContextMakeImageResident,
-                          (zeCtx, hDevice->ZeDevice, ZeImage.get()));
-      } catch (...) {
-        return exceptionToResult(std::current_exception());
-      }
-      ImageForOffset = ZeImage.get();
+    if (pImageDesc->type == UR_MEM_TYPE_IMAGE2D ||
+        pImageDesc->type == UR_MEM_TYPE_IMAGE3D) {
+      fprintf(stderr,
+              "[DBG] bindlessImagesCreateImpl: path=UNKNOWN (zeImageViewCreateExt)"
+              " zeImg1=%p hImageMem=%p\n",
+              (void *)zeImg1, (void *)hImageMem);
+      fflush(stderr);
+    }
+
+    try {
+      ZE2UR_CALL_THROWS(
+          zeImageViewCreateExt,
+          (zeCtx, hDevice->ZeDevice, &ZeImageDesc, zeImg1, ZeImage.ptr()));
+      ZE2UR_CALL_THROWS(zeContextMakeImageResident,
+                        (zeCtx, hDevice->ZeDevice, ZeImage.get()));
+    } catch (...) {
+      return exceptionToResult(std::current_exception());
     }
   } else if (MemAllocProperties.type == ZE_MEMORY_TYPE_DEVICE ||
              MemAllocProperties.type == ZE_MEMORY_TYPE_HOST ||
@@ -402,7 +384,6 @@ ur_result_t bindlessImagesCreateImpl(ur_context_handle_t hContext,
     } catch (...) {
       return exceptionToResult(std::current_exception());
     }
-    ImageForOffset = ZeImage.get();
   } else {
     return UR_RESULT_ERROR_INVALID_VALUE;
   }
@@ -413,7 +394,7 @@ ur_result_t bindlessImagesCreateImpl(ur_context_handle_t hContext,
   uint64_t DeviceOffset{};
   ze_image_handle_t ZeImageTranslated;
   ZE2UR_CALL(zelLoaderTranslateHandle,
-             (ZEL_HANDLE_IMAGE, ImageForOffset, (void **)&ZeImageTranslated));
+             (ZEL_HANDLE_IMAGE, ZeImage.get(), (void **)&ZeImageTranslated));
   ZE2UR_CALL(
       hDevice->Platform->ZeImageGetDeviceOffsetExt.zeImageGetDeviceOffsetExp,
       (ZeImageTranslated, &DeviceOffset));
@@ -430,11 +411,9 @@ ur_result_t bindlessImagesCreateImpl(ur_context_handle_t hContext,
   }
 
   std::shared_lock<ur_shared_mutex> Lock(hDevice->Mutex);
-  hDevice->ZeOffsetToImageHandleMap[*phImage] = {ImageForOffset,
-                                                 OwnsImageForOffset};
+  hDevice->ZeOffsetToImageHandleMap[*phImage] = ZeImage.get();
   Lock.release();
-  if (OwnsImageForOffset)
-    ZeImage.release();
+  ZeImage.release();
 
   return UR_RESULT_SUCCESS;
 }
@@ -1220,11 +1199,10 @@ ur_result_t urBindlessImagesUnsampledImageHandleDestroyExp(
   auto item = hDevice->ZeOffsetToImageHandleMap.find(hImage);
 
   if (item != hDevice->ZeOffsetToImageHandleMap.end()) {
-    auto handleEntry = item->second;
+    auto *handle = item->second;
     hDevice->ZeOffsetToImageHandleMap.erase(item);
     Lock.release();
-    if (handleEntry.ownsHandle)
-      ZE2UR_CALL(zeImageDestroy, (handleEntry.handle));
+    ZE2UR_CALL(zeImageDestroy, (handle));
   } else {
     Lock.release();
     return UR_RESULT_ERROR_INVALID_NULL_HANDLE;
@@ -1324,7 +1302,6 @@ ur_result_t urBindlessImagesImportExternalMemoryExp(
   struct ur_ze_external_memory_data *externalMemoryData =
       new struct ur_ze_external_memory_data;
   externalMemoryData->importExtensionDesc = nullptr;
-  externalMemoryData->handleType = memHandleType;
 
   void *pNext = const_cast<void *>(pExternalMemDesc->pNext);
   while (pNext != nullptr) {
@@ -1424,25 +1401,10 @@ ur_result_t urBindlessImagesMapExternalArrayExp(
   ZeStruct<ze_image_desc_t> ZeImageDesc;
   UR_CALL(ur2zeImageDesc(pImageFormat, pImageDesc, ZeImageDesc));
 
-  const bool IsD3D12ExternalResource =
-      externalMemoryData->handleType ==
-      UR_EXP_EXTERNAL_MEM_TYPE_WIN32_NT_DX12_RESOURCE;
-
+  ZeImageBindlessDesc.pNext = externalMemoryData->importExtensionDesc;
   ZeImageBindlessDesc.flags = ZE_IMAGE_BINDLESS_EXP_FLAG_BINDLESS;
   ZeImageDesc.flags = ZE_IMAGE_FLAG_KERNEL_WRITE;
-
-  ze_external_memory_import_win32_handle_t D3D12ImportDesc = {};
-  if (IsD3D12ExternalResource) {
-    D3D12ImportDesc =
-        *reinterpret_cast<ze_external_memory_import_win32_handle_t *>(
-            externalMemoryData->importExtensionDesc);
-    D3D12ImportDesc.pNext = &ZeImageBindlessDesc;
-    ZeImageBindlessDesc.pNext = nullptr;
-    ZeImageDesc.pNext = &D3D12ImportDesc;
-  } else {
-    ZeImageBindlessDesc.pNext = externalMemoryData->importExtensionDesc;
-    ZeImageDesc.pNext = &ZeImageBindlessDesc;
-  }
+  ZeImageDesc.pNext = &ZeImageBindlessDesc;
 
   if (pImageDesc->type == UR_MEM_TYPE_IMAGE2D ||
       pImageDesc->type == UR_MEM_TYPE_IMAGE3D) {
@@ -1465,8 +1427,7 @@ ur_result_t urBindlessImagesMapExternalArrayExp(
   }
 
   UR_CALL(createUrImgFromZeImage(hContext->getZeHandle(), hDevice->ZeDevice,
-                                 ZeImageDesc, phImageMem,
-                                 IsD3D12ExternalResource));
+                                 ZeImageDesc, phImageMem));
 
   return UR_RESULT_SUCCESS;
 }

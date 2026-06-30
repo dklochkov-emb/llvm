@@ -1363,7 +1363,6 @@ ur_result_t urBindlessImagesMapExternalArrayExp(
 
   ZeImageBindlessDesc.pNext = externalMemoryData->importExtensionDesc;
   ZeImageBindlessDesc.flags = ZE_IMAGE_BINDLESS_EXP_FLAG_BINDLESS;
-  ZeImageDesc.flags = ZE_IMAGE_FLAG_KERNEL_WRITE;
   ZeImageDesc.pNext = &ZeImageBindlessDesc;
 
   UR_CALL(createUrImgFromZeImage(hContext->getZeHandle(), hDevice->ZeDevice,

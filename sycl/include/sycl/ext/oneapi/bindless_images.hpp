@@ -16,6 +16,7 @@
 #include <sycl/ext/oneapi/bindless_images_interop.hpp>    // for external_m...
 #include <sycl/ext/oneapi/bindless_images_memory.hpp>     // for image_mem_...
 #include <sycl/ext/oneapi/bindless_images_sampler.hpp>    // for bindless_i...
+#include <sycl/ext/oneapi/experimental/builtins.hpp>      // for printf
 #include <sycl/image.hpp>                                 // for image_chan...
 #include <sycl/queue.hpp>                                 // for queue
 #include <sycl/range.hpp>                                 // for range
@@ -844,6 +845,67 @@ template <typename DataT> constexpr bool is_recognized_standard_type() {
           std::is_floating_point_v<DataT> || std::is_same_v<DataT, sycl::half>);
 }
 
+template <typename CoordT>
+void trace_fetch_image_call(const char *Kind, uint64_t RawHandle,
+                            const CoordT &Coords) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_BINDLESS_IMAGES_DEBUG_FETCH)
+  constexpr size_t CoordSize = coord_size<CoordT>();
+  if constexpr (CoordSize == 1) {
+    sycl::ext::oneapi::experimental::printf(
+        "[bindless-images-debug] fetch_image(%s) raw_handle=%llu "
+        "coordSize=1 x=%d\n",
+        Kind, static_cast<unsigned long long>(RawHandle), Coords);
+  } else if constexpr (CoordSize == 2) {
+    sycl::ext::oneapi::experimental::printf(
+        "[bindless-images-debug] fetch_image(%s) raw_handle=%llu "
+        "coordSize=2 x=%d y=%d\n",
+        Kind, static_cast<unsigned long long>(RawHandle), Coords[0],
+        Coords[1]);
+  } else if constexpr (CoordSize == 3) {
+    sycl::ext::oneapi::experimental::printf(
+        "[bindless-images-debug] fetch_image(%s) raw_handle=%llu "
+        "coordSize=3 x=%d y=%d z=%d\n",
+        Kind, static_cast<unsigned long long>(RawHandle), Coords[0], Coords[1],
+        Coords[2]);
+  }
+#else
+  (void)Kind;
+  (void)RawHandle;
+  (void)Coords;
+#endif
+}
+
+template <typename DataT>
+void trace_fetch_image_result(const char *Kind, uint64_t RawHandle,
+                              const DataT &Value) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_BINDLESS_IMAGES_DEBUG_FETCH)
+  if constexpr (std::is_integral_v<DataT>) {
+    sycl::ext::oneapi::experimental::printf(
+        "[bindless-images-debug] fetch_image(%s) raw_handle=%llu "
+        "result=%llu resultSize=%u\n",
+        Kind, static_cast<unsigned long long>(RawHandle),
+        static_cast<unsigned long long>(Value),
+        static_cast<unsigned>(sizeof(DataT)));
+  } else if constexpr (std::is_floating_point_v<DataT>) {
+    sycl::ext::oneapi::experimental::printf(
+        "[bindless-images-debug] fetch_image(%s) raw_handle=%llu "
+        "result=%f resultSize=%u\n",
+        Kind, static_cast<unsigned long long>(RawHandle),
+        static_cast<double>(Value), static_cast<unsigned>(sizeof(DataT)));
+  } else {
+    sycl::ext::oneapi::experimental::printf(
+        "[bindless-images-debug] fetch_image(%s) raw_handle=%llu "
+        "resultSize=%u\n",
+        Kind, static_cast<unsigned long long>(RawHandle),
+        static_cast<unsigned>(sizeof(DataT)));
+  }
+#else
+  (void)Kind;
+  (void)RawHandle;
+  (void)Value;
+#endif
+}
+
 #ifdef __SYCL_DEVICE_ONLY__
 
 // Image types used for generating SPIR-V
@@ -976,12 +1038,16 @@ DataT fetch_image(const unsampled_image_handle &imageHandle [[maybe_unused]],
                 "for 1D, 2D and 3D images, respectively.");
 
 #ifdef __SYCL_DEVICE_ONLY__
+  detail::trace_fetch_image_call("unsampled", imageHandle.raw_handle, coords);
   if constexpr (detail::is_recognized_standard_type<DataT>()) {
-    return FETCH_UNSAMPLED_IMAGE(
+    DataT Result = FETCH_UNSAMPLED_IMAGE(
         DataT,
         CONVERT_HANDLE_TO_IMAGE(imageHandle.raw_handle,
                                 detail::OCLImageTyRead<coordSize>),
         coords);
+    detail::trace_fetch_image_result("unsampled", imageHandle.raw_handle,
+                                     Result);
+    return Result;
 
   } else {
     static_assert(sizeof(HintT) == sizeof(DataT),
@@ -989,11 +1055,14 @@ DataT fetch_image(const unsampled_image_handle &imageHandle [[maybe_unused]],
                   "the same size as the user-defined DataT.");
     static_assert(detail::is_recognized_standard_type<HintT>(),
                   "HintT must always be a recognized standard type");
-    return sycl::bit_cast<DataT>(FETCH_UNSAMPLED_IMAGE(
+    DataT Result = sycl::bit_cast<DataT>(FETCH_UNSAMPLED_IMAGE(
         HintT,
         CONVERT_HANDLE_TO_IMAGE(imageHandle.raw_handle,
                                 detail::OCLImageTyRead<coordSize>),
         coords));
+    detail::trace_fetch_image_result("unsampled", imageHandle.raw_handle,
+                                     Result);
+    return Result;
   }
 #else
   assert(false); // Bindless images not yet implemented on host
@@ -1036,20 +1105,27 @@ DataT fetch_image(const sampled_image_handle &imageHandle [[maybe_unused]],
                 "HintT must always be a recognized standard type");
 
 #ifdef __SYCL_DEVICE_ONLY__
+  detail::trace_fetch_image_call("sampled", imageHandle.raw_handle, coords);
   // Convert the raw handle to an image and use FETCH_UNSAMPLED_IMAGE since
   // fetch_image should not use the sampler
   if constexpr (detail::is_recognized_standard_type<DataT>()) {
-    return FETCH_UNSAMPLED_IMAGE(
+    DataT Result = FETCH_UNSAMPLED_IMAGE(
         DataT,
         CONVERT_HANDLE_TO_IMAGE(imageHandle.raw_handle,
                                 detail::OCLImageTyRead<coordSize>),
         coords);
+    detail::trace_fetch_image_result("sampled", imageHandle.raw_handle,
+                                     Result);
+    return Result;
   } else {
-    return sycl::bit_cast<DataT>(FETCH_UNSAMPLED_IMAGE(
+    DataT Result = sycl::bit_cast<DataT>(FETCH_UNSAMPLED_IMAGE(
         HintT,
         CONVERT_HANDLE_TO_IMAGE(imageHandle.raw_handle,
                                 detail::OCLImageTyRead<coordSize>),
         coords));
+    detail::trace_fetch_image_result("sampled", imageHandle.raw_handle,
+                                     Result);
+    return Result;
   }
 #else
   assert(false); // Bindless images not yet implemented on host.

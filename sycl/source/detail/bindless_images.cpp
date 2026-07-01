@@ -15,6 +15,8 @@
 #include <detail/image_impl.hpp>
 #include <detail/queue_impl.hpp>
 
+#include <cstdlib>
+#include <iostream>
 #include <memory>
 
 namespace sycl {
@@ -53,6 +55,43 @@ void populate_ur_structs(const image_descriptor &desc, ur_image_desc_t &urDesc,
   urFormat.channelOrder = sycl::detail::convertChannelOrder(
       sycl::ext::oneapi::experimental::detail::get_image_default_channel_order(
           desc.num_channels));
+}
+
+static bool bindlessImagesDebugEnabled() {
+  static const bool Enabled = [] {
+    const char *Value = std::getenv("SYCL_BINDLESS_IMAGES_DEBUG");
+    return Value && !(Value[0] == '0' && Value[1] == '\0');
+  }();
+  return Enabled;
+}
+
+static void traceImageDescriptor(const char *Prefix,
+                                 const image_descriptor &Desc) {
+  if (!bindlessImagesDebugEnabled())
+    return;
+  std::cerr << "[bindless-images-debug] " << Prefix << " desc: width="
+            << Desc.width << " height=" << Desc.height
+            << " depth=" << Desc.depth << " arraySize=" << Desc.array_size
+            << " numChannels=" << Desc.num_channels << " channelType="
+            << static_cast<int>(Desc.channel_type) << " type="
+            << static_cast<int>(Desc.type) << " numLevels=" << Desc.num_levels
+            << "\n";
+}
+
+static void traceUrImageDescriptor(const char *Prefix,
+                                   const ur_image_desc_t &UrDesc,
+                                   const ur_image_format_t &UrFormat) {
+  if (!bindlessImagesDebugEnabled())
+    return;
+  std::cerr << "[bindless-images-debug] " << Prefix << " urDesc: type="
+            << UrDesc.type << " width=" << UrDesc.width
+            << " height=" << UrDesc.height << " depth=" << UrDesc.depth
+            << " rowPitch=" << UrDesc.rowPitch
+            << " slicePitch=" << UrDesc.slicePitch
+            << " arraySize=" << UrDesc.arraySize
+            << " numMipLevel=" << UrDesc.numMipLevel
+            << " channelOrder=" << UrFormat.channelOrder
+            << " channelType=" << UrFormat.channelType << "\n";
 }
 
 detail::image_mem_impl::image_mem_impl(const image_descriptor &desc,
@@ -237,19 +276,31 @@ create_image(image_mem_handle memHandle, const image_descriptor &desc,
              const sycl::device &syclDevice, const sycl::context &syclContext) {
   desc.verify();
 
+  traceImageDescriptor("create_image unsampled", desc);
+
   auto [urDevice, urCtx, Adapter] = get_ur_handles(syclDevice, syclContext);
 
   ur_image_desc_t urDesc;
   ur_image_format_t urFormat;
   populate_ur_structs(desc, urDesc, urFormat);
+  traceUrImageDescriptor("create_image unsampled", urDesc, urFormat);
 
   // Call impl.
   ur_exp_image_native_handle_t urImageHandle = 0;
+  if (bindlessImagesDebugEnabled())
+    std::cerr << "[bindless-images-debug] create_image unsampled call: "
+              << "imageMemHandle=" << memHandle.raw_handle
+              << " urCtx=" << urCtx << " urDevice=" << urDevice << "\n";
+
   Adapter
       ->call<sycl::errc::runtime,
              sycl::detail::UrApiKind::urBindlessImagesUnsampledImageCreateExp>(
           urCtx, urDevice, memHandle.raw_handle, &urFormat, &urDesc,
           &urImageHandle);
+
+  if (bindlessImagesDebugEnabled())
+    std::cerr << "[bindless-images-debug] create_image unsampled returned "
+              << "imageHandle=" << urImageHandle << "\n";
 
   return unsampled_image_handle{urImageHandle};
 }
@@ -479,11 +530,24 @@ __SYCL_EXPORT external_mem import_external_memory<resource_win32_handle>(
                           "Invalid memory handle type");
   }
 
+  if (bindlessImagesDebugEnabled())
+    std::cerr << "[bindless-images-debug] import_external_memory(win32_handle) "
+              << "inputHandle=" << externalMemDesc.external_resource.handle
+              << " size=" << externalMemDesc.size_in_bytes
+              << " syclHandleType="
+              << static_cast<int>(externalMemDesc.handle_type)
+              << " urHandleType=" << urHandleType << " urCtx=" << urCtx
+              << " urDevice=" << urDevice << "\n";
+
   Adapter
       ->call<sycl::errc::invalid,
              sycl::detail::UrApiKind::urBindlessImagesImportExternalMemoryExp>(
           urCtx, urDevice, externalMemDesc.size_in_bytes, urHandleType,
           &urExternalMemDescriptor, &urExternalMem);
+
+  if (bindlessImagesDebugEnabled())
+    std::cerr << "[bindless-images-debug] import_external_memory(win32_handle) "
+              << "returned externalMem=" << urExternalMem << "\n";
 
   return external_mem{urExternalMem};
 }
@@ -542,19 +606,31 @@ image_mem_handle map_external_image_memory(external_mem extMem,
                                            const sycl::context &syclContext) {
   desc.verify();
 
+  traceImageDescriptor("map_external_image_memory", desc);
+
   auto [urDevice, urCtx, Adapter] = get_ur_handles(syclDevice, syclContext);
 
   ur_image_desc_t urDesc;
   ur_image_format_t urFormat;
   populate_ur_structs(desc, urDesc, urFormat);
+  traceUrImageDescriptor("map_external_image_memory", urDesc, urFormat);
 
   ur_exp_external_mem_handle_t urExternalMem{extMem.raw_handle};
 
   image_mem_handle retHandle = {};
+  if (bindlessImagesDebugEnabled())
+    std::cerr << "[bindless-images-debug] map_external_image_memory call: "
+              << "externalMem=" << urExternalMem << " urCtx=" << urCtx
+              << " urDevice=" << urDevice << "\n";
+
   Adapter->call<sycl::errc::invalid,
                 sycl::detail::UrApiKind::urBindlessImagesMapExternalArrayExp>(
       urCtx, urDevice, &urFormat, &urDesc, urExternalMem,
       &retHandle.raw_handle);
+
+  if (bindlessImagesDebugEnabled())
+    std::cerr << "[bindless-images-debug] map_external_image_memory returned "
+              << "imageMemHandle=" << retHandle.raw_handle << "\n";
 
   return image_mem_handle{retHandle};
 }

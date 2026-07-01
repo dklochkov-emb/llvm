@@ -1609,16 +1609,6 @@ ur_result_t urBindlessImagesMapExternalArrayExp(
   ZeStruct<ze_image_desc_t> ZeImageDesc;
   UR_CALL(ur2zeImageDesc(pImageFormat, pImageDesc, ZeImageDesc));
 
-  if (pImageDesc->type == UR_MEM_TYPE_IMAGE1D ||
-      pImageDesc->type == UR_MEM_TYPE_IMAGE2D ||
-      pImageDesc->type == UR_MEM_TYPE_IMAGE3D) {
-    if (bindlessImagesDebugEnabled())
-      std::cerr << "[bindless-images-debug][l0] map_external_array "
-                << "forcing non-array zeImageDesc.arraylevels from "
-                << ZeImageDesc.arraylevels << " to 0\n";
-    ZeImageDesc.arraylevels = 0;
-  }
-
   ZeImageBindlessDesc.pNext = externalMemoryData->importExtensionDesc;
   ZeImageBindlessDesc.flags = ZE_IMAGE_BINDLESS_EXP_FLAG_BINDLESS;
   ZeImageDesc.pNext = &ZeImageBindlessDesc;

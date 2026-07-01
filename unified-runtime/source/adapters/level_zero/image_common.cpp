@@ -9,6 +9,9 @@
 
 #include <loader/ze_loader.h>
 
+#include <cstdlib>
+#include <iostream>
+
 #include "common.hpp"
 #ifdef UR_ADAPTER_LEVEL_ZERO_V2
 #include "v2/context.hpp"
@@ -23,6 +26,86 @@
 #include "ur_interface_loader.hpp"
 
 namespace {
+
+static bool bindlessImagesDebugEnabled() {
+  const char *Value = std::getenv("SYCL_BINDLESS_IMAGES_DEBUG");
+  return Value != nullptr && !(Value[0] == '0' && Value[1] == '\0');
+}
+
+static void traceZeImageDesc(const char *Prefix,
+                             const ze_image_desc_t &ZeImageDesc) {
+  if (!bindlessImagesDebugEnabled())
+    return;
+
+  std::cerr << "[bindless-images-debug][l0] " << Prefix
+            << " zeImageDesc=" << &ZeImageDesc
+            << " stype=" << ZeImageDesc.stype << " pNext=" << ZeImageDesc.pNext
+            << " flags=" << ZeImageDesc.flags << " type=" << ZeImageDesc.type
+            << " width=" << ZeImageDesc.width
+            << " height=" << ZeImageDesc.height
+            << " depth=" << ZeImageDesc.depth
+            << " arraylevels=" << ZeImageDesc.arraylevels
+            << " miplevels=" << ZeImageDesc.miplevels
+            << " format.layout=" << ZeImageDesc.format.layout
+            << " format.type=" << ZeImageDesc.format.type
+            << " swizzle=" << ZeImageDesc.format.x << ","
+            << ZeImageDesc.format.y << "," << ZeImageDesc.format.z << ","
+            << ZeImageDesc.format.w << "\n";
+}
+
+static void traceBindlessDesc(const char *Prefix,
+                              const ze_image_bindless_exp_desc_t &BindlessDesc) {
+  if (!bindlessImagesDebugEnabled())
+    return;
+
+  std::cerr << "[bindless-images-debug][l0] " << Prefix
+            << " bindlessDesc=" << &BindlessDesc
+            << " stype=" << BindlessDesc.stype
+            << " pNext=" << BindlessDesc.pNext
+            << " flags=" << BindlessDesc.flags << "\n";
+}
+
+static void traceExternalMemoryData(
+    const char *Prefix, const ur_ze_external_memory_data *ExternalMemoryData) {
+  if (!bindlessImagesDebugEnabled())
+    return;
+
+  std::cerr << "[bindless-images-debug][l0] " << Prefix
+            << " externalMemoryData=" << ExternalMemoryData;
+  if (!ExternalMemoryData) {
+    std::cerr << "\n";
+    return;
+  }
+
+  std::cerr << " size=" << ExternalMemoryData->size
+            << " type=" << ExternalMemoryData->type
+            << " importExtensionDesc="
+            << ExternalMemoryData->importExtensionDesc << "\n";
+
+  if (!ExternalMemoryData->importExtensionDesc)
+    return;
+
+  const auto *BaseDesc = static_cast<const ze_base_desc_t *>(
+      ExternalMemoryData->importExtensionDesc);
+  std::cerr << "[bindless-images-debug][l0] " << Prefix
+            << " importExtension stype=" << BaseDesc->stype
+            << " pNext=" << BaseDesc->pNext << "\n";
+
+  if (BaseDesc->stype == ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32) {
+    const auto *Win32Desc = static_cast<const ze_external_memory_import_win32_handle_t *>(
+        ExternalMemoryData->importExtensionDesc);
+    std::cerr << "[bindless-images-debug][l0] " << Prefix
+              << " win32Import flags=" << Win32Desc->flags
+              << " handle=" << Win32Desc->handle
+              << " name=" << Win32Desc->name << "\n";
+  } else if (BaseDesc->stype == ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD) {
+    const auto *FdDesc = static_cast<const ze_external_memory_import_fd_t *>(
+        ExternalMemoryData->importExtensionDesc);
+    std::cerr << "[bindless-images-debug][l0] " << Prefix
+              << " fdImport flags=" << FdDesc->flags << " fd=" << FdDesc->fd
+              << "\n";
+  }
+}
 
 /// Construct UR image format from ZE image desc.
 ur_result_t ze2urImageFormat(const ze_image_format_t &ZeImageFormat,
@@ -260,6 +343,8 @@ ur_result_t createUrImgFromZeImage(ze_context_handle_t hContext,
                                    ze_device_handle_t hDevice,
                                    const ZeStruct<ze_image_desc_t> &ZeImageDesc,
                                    ur_exp_image_mem_native_handle_t *pImg) {
+  traceZeImageDesc("createUrImgFromZeImage input", ZeImageDesc);
+
   v2::raii::ze_image_handle_t ZeImage;
   try {
     ZE2UR_CALL_THROWS(zeImageCreate,
@@ -273,6 +358,10 @@ ur_result_t createUrImgFromZeImage(ze_context_handle_t hContext,
   try {
     ur_bindless_mem_handle_t *urImg =
         new ur_bindless_mem_handle_t(ZeImage.get(), ZeImageDesc);
+    if (bindlessImagesDebugEnabled())
+      std::cerr << "[bindless-images-debug][l0] createUrImgFromZeImage "
+                << "created zeImage=" << ZeImage.get() << " urImg=" << urImg
+                << "\n";
     ZeImage.release();
     *pImg = reinterpret_cast<ur_exp_image_mem_native_handle_t>(urImg);
   } catch (...) {
@@ -1337,8 +1426,14 @@ ur_result_t urBindlessImagesImportExternalMemoryExp(
   }
   externalMemoryData->size = size;
 
+  traceExternalMemoryData("import_external_memory", externalMemoryData);
+
   *phExternalMem =
       reinterpret_cast<ur_exp_external_mem_handle_t>(externalMemoryData);
+  if (bindlessImagesDebugEnabled())
+    std::cerr << "[bindless-images-debug][l0] import_external_memory "
+              << "returned hExternalMem=" << *phExternalMem
+              << " memHandleType=" << memHandleType << "\n";
   return UR_RESULT_SUCCESS;
 }
 
@@ -1355,6 +1450,8 @@ ur_result_t urBindlessImagesMapExternalArrayExp(
   struct ur_ze_external_memory_data *externalMemoryData =
       reinterpret_cast<ur_ze_external_memory_data *>(hExternalMem);
 
+  traceExternalMemoryData("map_external_array input", externalMemoryData);
+
   ze_image_bindless_exp_desc_t ZeImageBindlessDesc = {};
   ZeImageBindlessDesc.stype = ZE_STRUCTURE_TYPE_BINDLESS_IMAGE_EXP_DESC;
 
@@ -1365,8 +1462,15 @@ ur_result_t urBindlessImagesMapExternalArrayExp(
   ZeImageBindlessDesc.flags = ZE_IMAGE_BINDLESS_EXP_FLAG_BINDLESS;
   ZeImageDesc.pNext = &ZeImageBindlessDesc;
 
+  traceBindlessDesc("map_external_array", ZeImageBindlessDesc);
+  traceZeImageDesc("map_external_array final", ZeImageDesc);
+
   UR_CALL(createUrImgFromZeImage(hContext->getZeHandle(), hDevice->ZeDevice,
                                  ZeImageDesc, phImageMem));
+
+  if (bindlessImagesDebugEnabled())
+    std::cerr << "[bindless-images-debug][l0] map_external_array "
+              << "returned imageMem=" << *phImageMem << "\n";
 
   return UR_RESULT_SUCCESS;
 }

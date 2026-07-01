@@ -9,8 +9,11 @@
 
 #include <loader/ze_loader.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <vector>
 
 #include "common.hpp"
 #ifdef UR_ADAPTER_LEVEL_ZERO_V2
@@ -104,6 +107,125 @@ static void traceExternalMemoryData(
     std::cerr << "[bindless-images-debug][l0] " << Prefix
               << " fdImport flags=" << FdDesc->flags << " fd=" << FdDesc->fd
               << "\n";
+  }
+}
+
+static size_t getZeImageFormatPixelSizeBytes(const ze_image_format_t &Format) {
+  switch (Format.layout) {
+  case ZE_IMAGE_FORMAT_LAYOUT_8:
+    return 1;
+  case ZE_IMAGE_FORMAT_LAYOUT_8_8:
+    return 2;
+  case ZE_IMAGE_FORMAT_LAYOUT_8_8_8:
+    return 3;
+  case ZE_IMAGE_FORMAT_LAYOUT_8_8_8_8:
+    return 4;
+  case ZE_IMAGE_FORMAT_LAYOUT_16:
+    return 2;
+  case ZE_IMAGE_FORMAT_LAYOUT_16_16:
+    return 4;
+  case ZE_IMAGE_FORMAT_LAYOUT_16_16_16:
+    return 6;
+  case ZE_IMAGE_FORMAT_LAYOUT_16_16_16_16:
+    return 8;
+  case ZE_IMAGE_FORMAT_LAYOUT_32:
+    return 4;
+  case ZE_IMAGE_FORMAT_LAYOUT_32_32:
+    return 8;
+  case ZE_IMAGE_FORMAT_LAYOUT_32_32_32:
+    return 12;
+  case ZE_IMAGE_FORMAT_LAYOUT_32_32_32_32:
+    return 16;
+  default:
+    return 0;
+  }
+}
+
+static void traceRawZeImageValuesAfterCreate(ur_context_handle_t hContext,
+                                             ur_device_handle_t hDevice,
+                                             ze_image_handle_t ZeImage,
+                                             const ze_image_desc_t &ZeImageDesc) {
+  if (!bindlessImagesDebugEnabled())
+    return;
+
+  const size_t PixelSize = getZeImageFormatPixelSizeBytes(ZeImageDesc.format);
+  if (PixelSize == 0) {
+    std::cerr << "[bindless-images-debug][l0] raw ze image copy skipped: "
+              << "unsupported format.layout=" << ZeImageDesc.format.layout
+              << "\n";
+    return;
+  }
+
+  const uint32_t CopyWidth = static_cast<uint32_t>(
+      std::max<uint64_t>(1, std::min<uint64_t>(ZeImageDesc.width, 4)));
+  const uint32_t CopyHeight = static_cast<uint32_t>(
+      ZeImageDesc.type == ZE_IMAGE_TYPE_1D
+          ? 1
+          : std::max<uint64_t>(1, std::min<uint64_t>(ZeImageDesc.height, 4)));
+  const uint32_t CopyDepth = 1;
+  const size_t RowPitch = CopyWidth * PixelSize;
+  const size_t SlicePitch = RowPitch * CopyHeight;
+  const size_t TotalBytes = SlicePitch * CopyDepth;
+  const size_t FullTightBytes = ZeImageDesc.width * ZeImageDesc.height *
+                                ZeImageDesc.depth * PixelSize;
+  std::vector<unsigned char> HostCopy(TotalBytes, 0xCD);
+
+  std::cerr << "[bindless-images-debug][l0] raw ze image copy after create: "
+            << "zeImage=" << ZeImage << " pixelSize=" << PixelSize
+            << " fullTightBytes=" << FullTightBytes
+            << " copyRegion=" << CopyWidth << "x" << CopyHeight << "x"
+            << CopyDepth << " rowPitch=" << RowPitch
+            << " slicePitch=" << SlicePitch
+            << " totalBytes=" << TotalBytes << "\n";
+
+  ze_command_list_handle_t ZeCommandList = nullptr;
+  try {
+    ZeStruct<ze_command_queue_desc_t> ZeCommandQueueDesc;
+    ZeCommandQueueDesc.ordinal =
+        hDevice->QueueGroup[ur_device_handle_t_::queue_group_info_t::Compute]
+            .ZeOrdinal;
+    ZeCommandQueueDesc.index = 0;
+    ZeCommandQueueDesc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
+
+    ZE2UR_CALL_THROWS(zeCommandListCreateImmediate,
+                      (hContext->getZeHandle(), hDevice->ZeDevice,
+                       &ZeCommandQueueDesc, &ZeCommandList));
+
+    ze_image_region_t Region = {0, 0, 0, CopyWidth, CopyHeight, CopyDepth};
+    ZE2UR_CALL_THROWS(zeCommandListAppendImageCopyToMemoryExt,
+                      (ZeCommandList, HostCopy.data(), ZeImage, &Region,
+                       RowPitch, SlicePitch, nullptr, 0, nullptr));
+    ZE2UR_CALL_THROWS(zeCommandListHostSynchronize,
+                      (ZeCommandList, UINT64_MAX));
+  } catch (...) {
+    ur_result_t Result = exceptionToResult(std::current_exception());
+    std::cerr << "[bindless-images-debug][l0] raw ze image copy after create "
+              << "failed result=" << Result << "\n";
+    if (ZeCommandList)
+      ZE_CALL_NOCHECK(zeCommandListDestroy, (ZeCommandList));
+    return;
+  }
+
+  ZE_CALL_NOCHECK(zeCommandListDestroy, (ZeCommandList));
+
+  const size_t BytesToPrint = std::min<size_t>(HostCopy.size(), 64);
+  std::cerr << "[bindless-images-debug][l0] raw ze image copy after create "
+            << "raw bytes:";
+  for (size_t I = 0; I < BytesToPrint; ++I)
+    std::cerr << " " << static_cast<unsigned>(HostCopy[I]);
+  if (BytesToPrint < HostCopy.size())
+    std::cerr << " ...";
+  std::cerr << "\n";
+
+  if (ZeImageDesc.format.layout == ZE_IMAGE_FORMAT_LAYOUT_32 &&
+      ZeImageDesc.format.type == ZE_IMAGE_FORMAT_TYPE_UINT) {
+    const uint32_t *Values =
+        reinterpret_cast<const uint32_t *>(HostCopy.data());
+    const size_t ValuesToPrint =
+        std::min<size_t>(HostCopy.size() / sizeof(uint32_t), 16);
+    for (size_t I = 0; I < ValuesToPrint; ++I)
+      std::cerr << "[bindless-images-debug][l0] raw ze image copy after "
+                << "create value[" << I << "]=" << Values[I] << "\n";
   }
 }
 
@@ -339,8 +461,8 @@ ur_result_t ze2urImageFormat(const ze_image_format_t &ZeImageFormat,
 }
 
 /// Construct UR bindless image struct from ZE image handle and desc.
-ur_result_t createUrImgFromZeImage(ze_context_handle_t hContext,
-                                   ze_device_handle_t hDevice,
+ur_result_t createUrImgFromZeImage(ur_context_handle_t hContext,
+                                   ur_device_handle_t hDevice,
                                    const ZeStruct<ze_image_desc_t> &ZeImageDesc,
                                    ur_exp_image_mem_native_handle_t *pImg) {
   traceZeImageDesc("createUrImgFromZeImage input", ZeImageDesc);
@@ -348,12 +470,17 @@ ur_result_t createUrImgFromZeImage(ze_context_handle_t hContext,
   v2::raii::ze_image_handle_t ZeImage;
   try {
     ZE2UR_CALL_THROWS(zeImageCreate,
-                      (hContext, hDevice, &ZeImageDesc, ZeImage.ptr()));
+                      (hContext->getZeHandle(), hDevice->ZeDevice,
+                       &ZeImageDesc, ZeImage.ptr()));
     ZE2UR_CALL_THROWS(zeContextMakeImageResident,
-                      (hContext, hDevice, ZeImage.get()));
+                      (hContext->getZeHandle(), hDevice->ZeDevice,
+                       ZeImage.get()));
   } catch (...) {
     return exceptionToResult(std::current_exception());
   }
+
+  traceRawZeImageValuesAfterCreate(hContext, hDevice, ZeImage.get(),
+                                   ZeImageDesc);
 
   try {
     ur_bindless_mem_handle_t *urImg =
@@ -1011,6 +1138,26 @@ ur_result_t bindlessImagesHandleCopyFlags(
     char *DstPtr =
         static_cast<char *>(pDst) + pCopyRegion->dstOffset.z * DstSlicePitch +
         pCopyRegion->dstOffset.y * DstRowPitch + pCopyRegion->dstOffset.x;
+    if (bindlessImagesDebugEnabled()) {
+      std::cerr << "[bindless-images-debug][l0] image_copy image_to_mem: "
+                << "urSrcImg=" << urSrcImg
+                << " zeImage=" << urSrcImg->getZeImage()
+                << " srcFormat.layout=" << urSrcImg->getFormat().layout
+                << " srcFormat.type=" << urSrcImg->getFormat().type
+                << " srcDims=" << urSrcImg->getWidth() << "x"
+                << urSrcImg->getHeight() << "x" << urSrcImg->getDepth()
+                << " srcPixelSize=" << SrcPixelSizeInBytes
+                << " urCopyExtentBytes=" << pCopyRegion->copyExtent.width
+                << "x" << pCopyRegion->copyExtent.height << "x"
+                << pCopyRegion->copyExtent.depth
+                << " zeRegion=" << SrcRegion.originX << ","
+                << SrcRegion.originY << "," << SrcRegion.originZ << " "
+                << SrcRegion.width << "x" << SrcRegion.height << "x"
+                << SrcRegion.depth << " dst=" << static_cast<void *>(DstPtr)
+                << " dstRowPitch=" << DstRowPitch
+                << " dstSlicePitch=" << DstSlicePitch
+                << " waitEvents=" << numWaitEvents << "\n";
+    }
     ZE2UR_CALL(zeCommandListAppendImageCopyToMemoryExt,
                (ZeCommandList, DstPtr, urSrcImg->getZeImage(), &SrcRegion,
                 DstRowPitch, DstSlicePitch, zeSignalEvent, numWaitEvents,
@@ -1203,8 +1350,7 @@ ur_result_t urBindlessImagesImageAllocateExp(
   ZeImageBindlessDesc.flags = ZE_IMAGE_BINDLESS_EXP_FLAG_BINDLESS;
   ZeImageDesc.pNext = &ZeImageBindlessDesc;
 
-  UR_CALL(createUrImgFromZeImage(hContext->getZeHandle(), hDevice->ZeDevice,
-                                 ZeImageDesc, phImageMem));
+  UR_CALL(createUrImgFromZeImage(hContext, hDevice, ZeImageDesc, phImageMem));
   return UR_RESULT_SUCCESS;
 }
 
@@ -1465,8 +1611,7 @@ ur_result_t urBindlessImagesMapExternalArrayExp(
   traceBindlessDesc("map_external_array", ZeImageBindlessDesc);
   traceZeImageDesc("map_external_array final", ZeImageDesc);
 
-  UR_CALL(createUrImgFromZeImage(hContext->getZeHandle(), hDevice->ZeDevice,
-                                 ZeImageDesc, phImageMem));
+  UR_CALL(createUrImgFromZeImage(hContext, hDevice, ZeImageDesc, phImageMem));
 
   if (bindlessImagesDebugEnabled())
     std::cerr << "[bindless-images-debug][l0] map_external_array "

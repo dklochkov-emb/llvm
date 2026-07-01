@@ -15,9 +15,12 @@
 #include <detail/image_impl.hpp>
 #include <detail/queue_impl.hpp>
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
+#include <vector>
 
 namespace sycl {
 inline namespace _V1 {
@@ -92,6 +95,123 @@ static void traceUrImageDescriptor(const char *Prefix,
             << " numMipLevel=" << UrDesc.numMipLevel
             << " channelOrder=" << UrFormat.channelOrder
             << " channelType=" << UrFormat.channelType << "\n";
+}
+
+static void traceCopiedImageBytes(const char *Prefix,
+                                  const std::vector<unsigned char> &Bytes,
+                                  const image_descriptor &Desc,
+                                  size_t PixelSize) {
+  if (!bindlessImagesDebugEnabled())
+    return;
+
+  const size_t PixelCount = Desc.width * (Desc.height ? Desc.height : 1) *
+                            (Desc.depth ? Desc.depth : 1);
+  const size_t ValueCount = PixelCount * Desc.num_channels;
+  const size_t ValuesToPrint = std::min<size_t>(ValueCount, 32);
+  const size_t BytesToPrint = std::min<size_t>(Bytes.size(), 128);
+
+  std::cerr << "[bindless-images-debug] " << Prefix
+            << " copied image bytes: totalBytes=" << Bytes.size()
+            << " pixelSize=" << PixelSize << " pixelCount=" << PixelCount
+            << " valueCount=" << ValueCount << " printedValues="
+            << ValuesToPrint << " printedBytes=" << BytesToPrint << "\n";
+
+  std::cerr << "[bindless-images-debug] " << Prefix << " raw bytes:";
+  for (size_t I = 0; I < BytesToPrint; ++I)
+    std::cerr << " " << static_cast<unsigned>(Bytes[I]);
+  std::cerr << "\n";
+
+  switch (Desc.channel_type) {
+  case sycl::image_channel_type::unsigned_int32: {
+    const uint32_t *Values = reinterpret_cast<const uint32_t *>(Bytes.data());
+    for (size_t I = 0; I < ValuesToPrint; ++I)
+      std::cerr << "[bindless-images-debug] " << Prefix << " value[" << I
+                << "]=" << Values[I] << "\n";
+    break;
+  }
+  case sycl::image_channel_type::signed_int32: {
+    const int32_t *Values = reinterpret_cast<const int32_t *>(Bytes.data());
+    for (size_t I = 0; I < ValuesToPrint; ++I)
+      std::cerr << "[bindless-images-debug] " << Prefix << " value[" << I
+                << "]=" << Values[I] << "\n";
+    break;
+  }
+  case sycl::image_channel_type::fp32: {
+    const float *Values = reinterpret_cast<const float *>(Bytes.data());
+    for (size_t I = 0; I < ValuesToPrint; ++I)
+      std::cerr << "[bindless-images-debug] " << Prefix << " value[" << I
+                << "]=" << Values[I] << "\n";
+    break;
+  }
+  case sycl::image_channel_type::unsigned_int8:
+  case sycl::image_channel_type::unorm_int8: {
+    for (size_t I = 0; I < ValuesToPrint; ++I)
+      std::cerr << "[bindless-images-debug] " << Prefix << " value[" << I
+                << "]=" << static_cast<unsigned>(Bytes[I]) << "\n";
+    break;
+  }
+  default:
+    std::cerr << "[bindless-images-debug] " << Prefix
+              << " typed value dump skipped for channelType="
+              << static_cast<int>(Desc.channel_type) << "\n";
+    break;
+  }
+}
+
+static void traceImageMemoryValues(const char *Prefix, image_mem_handle Mem,
+                                   const image_descriptor &Desc,
+                                   const sycl::queue &SyclQueue) {
+  if (!bindlessImagesDebugEnabled())
+    return;
+
+  try {
+    auto QueueImpl = sycl::detail::getSyclObjImpl(SyclQueue);
+    sycl::detail::adapter_impl &Adapter = QueueImpl->getAdapter();
+
+    ur_image_desc_t SrcDesc;
+    ur_image_format_t SrcFormat;
+    populate_ur_structs(Desc, SrcDesc, SrcFormat);
+    ur_image_desc_t DstDesc = SrcDesc;
+    ur_image_format_t DstFormat = SrcFormat;
+
+    const size_t PixelSize =
+        sycl::detail::getImageElementSize(Desc.num_channels, Desc.channel_type);
+    const size_t Height = Desc.height ? Desc.height : 1;
+    const size_t Depth = Desc.depth ? Desc.depth : 1;
+    const size_t RowPitch = Desc.width * PixelSize;
+    const size_t TotalBytes = RowPitch * Height * Depth;
+    std::vector<unsigned char> HostCopy(TotalBytes, 0xCD);
+
+    DstDesc.rowPitch = RowPitch;
+
+    ur_exp_image_copy_region_t CopyRegion{};
+    CopyRegion.stype = UR_STRUCTURE_TYPE_EXP_IMAGE_COPY_REGION;
+    CopyRegion.srcOffset = {0, 0, 0};
+    CopyRegion.dstOffset = {0, 0, 0};
+    CopyRegion.copyExtent = {Desc.width * PixelSize, Height, Depth};
+
+    std::cerr << "[bindless-images-debug] " << Prefix
+              << " debug copy imageMemHandle=" << Mem.raw_handle
+              << " totalBytes=" << TotalBytes << " rowPitch=" << RowPitch
+              << " copyExtentBytes=" << CopyRegion.copyExtent.width
+              << "x" << CopyRegion.copyExtent.height << "x"
+              << CopyRegion.copyExtent.depth << "\n";
+
+    Adapter.call<sycl::detail::UrApiKind::urBindlessImagesImageCopyExp>(
+        QueueImpl->getHandleRef(), reinterpret_cast<const void *>(Mem.raw_handle),
+        HostCopy.data(), &SrcDesc, &DstDesc, &SrcFormat, &DstFormat,
+        &CopyRegion, UR_EXP_IMAGE_COPY_FLAG_DEVICE_TO_HOST,
+        UR_EXP_IMAGE_COPY_INPUT_TYPES_IMAGE_TO_MEM, 0, nullptr, nullptr);
+    QueueImpl->wait();
+
+    traceCopiedImageBytes(Prefix, HostCopy, Desc, PixelSize);
+  } catch (const std::exception &E) {
+    std::cerr << "[bindless-images-debug] " << Prefix
+              << " debug image copy failed: " << E.what() << "\n";
+  } catch (...) {
+    std::cerr << "[bindless-images-debug] " << Prefix
+              << " debug image copy failed with unknown exception\n";
+  }
 }
 
 detail::image_mem_impl::image_mem_impl(const image_descriptor &desc,
@@ -308,8 +428,13 @@ create_image(image_mem_handle memHandle, const image_descriptor &desc,
 __SYCL_EXPORT unsampled_image_handle
 create_image(image_mem_handle memHandle, const image_descriptor &desc,
              const sycl::queue &syclQueue) {
-  return create_image(memHandle, desc, syclQueue.get_device(),
-                      syclQueue.get_context());
+  traceImageMemoryValues("create_image unsampled before", memHandle, desc,
+                         syclQueue);
+  unsampled_image_handle ImageHandle = create_image(
+      memHandle, desc, syclQueue.get_device(), syclQueue.get_context());
+  traceImageMemoryValues("create_image unsampled after", memHandle, desc,
+                         syclQueue);
+  return ImageHandle;
 }
 
 __SYCL_EXPORT sampled_image_handle
@@ -639,8 +764,11 @@ __SYCL_EXPORT
 image_mem_handle map_external_image_memory(external_mem extMem,
                                            const image_descriptor &desc,
                                            const sycl::queue &syclQueue) {
-  return map_external_image_memory(extMem, desc, syclQueue.get_device(),
-                                   syclQueue.get_context());
+  image_mem_handle MappedImageMem = map_external_image_memory(
+      extMem, desc, syclQueue.get_device(), syclQueue.get_context());
+  traceImageMemoryValues("map_external_image_memory after", MappedImageMem,
+                         desc, syclQueue);
+  return MappedImageMem;
 }
 
 __SYCL_EXPORT

@@ -35,6 +35,11 @@ static bool bindlessImagesDebugEnabled() {
   return Value != nullptr && !(Value[0] == '0' && Value[1] == '\0');
 }
 
+static bool bindlessImagesL0RawCopyDebugEnabled() {
+  const char *Value = std::getenv("SYCL_BINDLESS_IMAGES_DEBUG_L0_COPY");
+  return Value != nullptr && !(Value[0] == '0' && Value[1] == '\0');
+}
+
 static void traceZeImageDesc(const char *Prefix,
                              const ze_image_desc_t &ZeImageDesc) {
   if (!bindlessImagesDebugEnabled())
@@ -145,7 +150,7 @@ static void traceRawZeImageValuesAfterCreate(ur_context_handle_t hContext,
                                              ur_device_handle_t hDevice,
                                              ze_image_handle_t ZeImage,
                                              const ze_image_desc_t &ZeImageDesc) {
-  if (!bindlessImagesDebugEnabled())
+  if (!bindlessImagesL0RawCopyDebugEnabled())
     return;
 
   const size_t PixelSize = getZeImageFormatPixelSizeBytes(ZeImageDesc.format);

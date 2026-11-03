@@ -1,6 +1,10 @@
 // REQUIRES: arch-intel_gpu_cri
-// RUN: %{build} %{full_atomic_flags} -o %t.out
-// RUN: %{run} %t.out
+// RUN: %{build} %{atomic16_flags} -o %t.16.out
+// RUN: %{run} %t.16.out
+// RUN: %{build} %{atomic32_flags} -o %t.32.out
+// RUN: %{run} %t.32.out
+// RUN: %{build} %{atomic64_flags} -o %t.64.out
+// RUN: %{run} %t.64.out
 
 // UNSUPPORTED: target-nvidia, target-amd, spirv-backend
 // UNSUPPORTED-INTENDED: only supported by backends with atomic16 support
